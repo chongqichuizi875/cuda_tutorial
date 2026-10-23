@@ -1249,3 +1249,243 @@ CPU 顺序累加标准答案: 30075.328125
    **为什么代码里要用 `__float_as_int` 和 `__int_as_float`？** 因为 CUDA 的 `atomicCAS` 硬件接口只按整数比特位做比较（只收 `int*` / `unsigned int*`），不直接收 `float*`。
    - 不能用 C 语言强转 `(int)x`（那会把 `3.14f` 截断成整数 `3`）；
    - 必须用 CUDA 内置的比特位重解释函数：`__float_as_int(x)`（把 `float` 的 32 个 0/1 比特原封不动当成 `int` 传给 `atomicCAS`）和 `__int_as_float(k)`（把读回来的 32 位 `int` 比特还原回 `float` 做加法）。
+
+---
+
+# 第七关：RAII 显存管理与 CUDA Stream 异步流
+
+回想一下第 3 关：当时我们在 `03_memory.cu` 里每次申请显存都要手写 `cudaMalloc(&dev_a, bytes)`，用完还要手写 `cudaFree(dev_a)`。如果一个函数里有七八个数组，或者中途报错提前退出了，一旦漏写 `cudaFree` 就会显存泄漏；反过来如果对同一个指针不小心调用了两次 `cudaFree`，程序又会当场崩溃。
+
+另外，前 6 关我们每次启动核函数都只写 `<<<grid, block>>>`，每跑一步 CPU 都要停下来等 GPU。这一关我们写一个程序 `07_raii_stream.cu`，完成两件具体的事：
+
+1. **给显存配一个「自动管家类」 `GpuBuffer`**：创建对象时自动申请显存，离开大括号 `{}` 时自动调 `cudaFree` 释放；并且规定一块显存同时只能归一个对象管（只允许转交所有权，不允许复制指针）。
+2. **用一条「异步流水线」 `cudaStream_t` 连续跑多个任务**：把「清零状态 $\rightarrow$ 核函数 1 填数 $\rightarrow$ 核函数 2 乘加 $\rightarrow$ 拷回 CPU」全部塞进同一条流水线里排队自动执行，CPU 只在最后读取结果前等一次。
+
+## 动手写 `07_raii_stream.cu`
+
+1. 先在 `h20-247` 上打开 `vim /root/CMakeLists.txt`，在文件末尾加一行：
+
+```cmake
+add_executable(07_raii_stream 07_raii_stream.cu)
+```
+
+2. 打开 `vim /root/07_raii_stream.cu`，敲入下面的代码（所有新语法的解释都直接写在了对应代码行的上方注释里，不用上下翻页对照）：
+
+```cpp
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstddef>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+// 自己写一个 5 行的错误检查函数（作用和第 3 关的 checkCudaErrors 一样）：
+// 只要 CUDA 函数返回的状态码不是 cudaSuccess (0)，
+// 就用 cudaGetErrorString 把错误码翻译成英文报错，并用 throw 抛出异常停下程序
+inline void cuda_check(cudaError_t status) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(status));
+    }
+}
+
+// ==================== 第一部分：显存自动管家类 GpuBuffer ====================
+// template <class T> 叫「模板」：把元素类型做成填空题 T。
+// 当你写 GpuBuffer<float> 时，编译器自动把下面所有的 T 替换成 float；
+// 当你写 GpuBuffer<int>   时，编译器自动把下面所有的 T 替换成 int。
+template <class T>
+class GpuBuffer {
+    T* ptr_ = nullptr;        // 成员变量 1：保存 GPU 显存地址的指针（初始为空指针 nullptr）
+    std::size_t count_ = 0;   // 成员变量 2：保存数组的元素个数（size_t 就是无符号整数）
+
+public:
+    // 【1. 构造函数】函数名与类名完全一样，创建对象 GpuBuffer<float> a(4); 时自动执行。
+    // 语法拆解：
+    //   - explicit：禁止编译器做隐式转换（比如防止写出 GpuBuffer<float> a = 4; 这种怪代码，强制只能写 a(4)）。
+    //   - : count_(n) 叫「成员初始化列表」，意思就是在进入大括号 { 之前，先把参数 n 赋值给成员变量 count_
+    //     （完全等价于在大括号第一行写 count_ = n;）。
+    //   - reinterpret_cast<void**>(&ptr_)：就是 C 语言里的指针强制类型转换 (void**)&ptr_。
+    //     因为 cudaMalloc 底层 C 接口规定第一个参数类型是 void**（通用二级指针），
+    //     而 &ptr_ 的类型是 T**（如 float**），所以用 reinterpret_cast 把指针类型强转成 void**。
+    explicit GpuBuffer(std::size_t n) : count_(n) {
+        if (n > 0) {
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&ptr_), n * sizeof(T)));
+        }
+    }
+
+    // 【2. 析构函数】类名前面加波浪号 ~，当对象离开大括号 {} 寿命结束时，由编译器自动调用。
+    // 语法拆解：
+    //   - noexcept：向编译器保证「这个函数里绝不会 throw 抛出异常」（C++ 规定析构函数不能抛异常，否则程序直接强退）。
+    //   - 因此里面只写 if (ptr_) cudaFree(ptr_);，千万不要在析构函数外面包会抛异常的 cuda_check！
+    ~GpuBuffer() noexcept {
+        if (ptr_) {
+            cudaFree(ptr_);
+        }
+    }
+
+    // 【3. 禁止拷贝（2 个函数）】
+    // 语法拆解：
+    //   - const GpuBuffer& 是普通的拷贝引用；后面写 = delete 意思是「废除这个函数」。
+    //   - 一旦有人在代码里写 GpuBuffer b = a;（拷贝构造）或 b = a;（拷贝赋值），编译器直接报错拦住！
+    GpuBuffer(const GpuBuffer&) = delete;
+    GpuBuffer& operator=(const GpuBuffer&) = delete;
+
+    // 【4. 移动构造函数】当写 GpuBuffer b(std::move(a)); 把旧对象 a 转交给新对象 b 时自动执行。
+    // 语法拆解：
+    //   - GpuBuffer&&（两个 &）叫「右值引用」，专门用来接收 std::move(a) 传过来的「即将废弃的对象」。
+    //   - 里面就干最直白的 4 步：把 other 的指针和长度拿过来，再把 other 的指针置空、长度清零。
+    //   - 这样 other 后面析构时看到 other.ptr_ 是 nullptr 就不会重复调 cudaFree 了！
+    GpuBuffer(GpuBuffer&& other) noexcept {
+        ptr_ = other.ptr_;       // 1. 拿走 other 的显存地址
+        count_ = other.count_;   // 2. 拿走 other 的元素个数
+        other.ptr_ = nullptr;    // 3. 把 other 的指针清空
+        other.count_ = 0;        // 4. 把 other 的长度清零
+    }
+
+    // 【5. 移动赋值函数】当 b 和 c 都已经创建好了，写 c = std::move(b); 时自动执行。
+    // 语法拆解：
+    //   - this 是当前对象 c 自己的地址，&other 是右边对象 b 的地址。
+    //   - 第一步必须先判断 if (this != &other)：防止有人写出 c = std::move(c);（自己转给自己）时误把自己的显存释放掉。
+    //   - 第二步必须先释放 c 自己原本占用的旧显存 if (ptr_) cudaFree(ptr_);，然后再接管 other 的指针并清空 other。
+    GpuBuffer& operator=(GpuBuffer&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) {
+                cudaFree(ptr_);  // 1. 先释放当前对象原本持有的旧显存（防内存泄漏）
+            }
+            ptr_ = other.ptr_;   // 2. 接管 other 的显存地址
+            count_ = other.count_;
+            other.ptr_ = nullptr;// 3. 把 other 清空
+            other.count_ = 0;
+        }
+        return *this;            // 返回当前对象自身的引用
+    }
+
+    // 普通成员函数：取出底层显存裸指针和元素个数
+    T* data() const noexcept { return ptr_; }
+    std::size_t size() const noexcept { return count_; }
+};
+
+// ==================== 第二部分：在流水线 (Stream) 里跑核函数 ====================
+// 核函数 1：用第 4 关学过的网格跨步循环，填入 a[i] = 0, 1, 2, ...
+__global__ void fill_seq_kernel(float* a, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < n; i += stride) {
+        a[i] = float(i);
+    }
+}
+
+// 核函数 2：用网格跨步循环，把每个元素乘上 scale 再加 bias
+__global__ void scale_bias_kernel(float* a, int n, float scale, float bias) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < n; i += stride) {
+        a[i] = a[i] * scale + bias;
+    }
+}
+
+// 把整套 GPU 操作放进指定的 stream 流水线中
+void run_pipeline_async(float* d_a, int* d_status, int n, cudaStream_t stream) {
+    // 1. cudaMemsetAsync：在指定的 stream 流水线里把 d_status 的 4 个字节（sizeof(int)）清零。
+    //    注意：哪怕 n == 0，状态清零也要执行。
+    cuda_check(cudaMemsetAsync(d_status, 0, sizeof(int), stream));
+
+    // 2. 边界保护：如果数组长度 n <= 0，直接 return，千万不能往下走启动核函数！
+    //    （因为 n == 0 时算出的 grid 是 0，启动 <<<0, 256>>> 会报错 cudaErrorInvalidConfiguration）
+    if (n <= 0) return;
+
+    int block = 256;
+    int grid = (n - 1) / block + 1;
+
+    // 3. 核函数完整四参数启动语法：<<<grid, block, 动态共享内存字节数, stream>>>
+    //    这里不用动态共享内存，所以第 3 个参数写 0，第 4 个参数传入流水线 stream。
+    //    把两个核函数先后塞进同一个 stream，GPU 硬件会自动排队：等 fill_seq_kernel 全部算完，才跑 scale_bias_kernel。
+    fill_seq_kernel<<<grid, block, 0, stream>>>(d_a, n);
+    //    核函数启动没有返回值，必须紧跟一句 cudaGetLastError() 抓取启动参数错误（比如 block > 1024）
+    cuda_check(cudaGetLastError());
+
+    scale_bias_kernel<<<grid, block, 0, stream>>>(d_a, n, 2.0f, 10.0f);
+    cuda_check(cudaGetLastError());
+}
+
+int main() {
+    // ================= 实验 1：测试 GpuBuffer 的转交与防呆能力 =================
+    printf("=== 实验 1：测试 GpuBuffer 自动管家 ===\n");
+    GpuBuffer<float> empty_buf(0);
+    printf("1) 空对象 empty_buf(0): data = %p, size = %zu\n",
+           (void*)empty_buf.data(), empty_buf.size());
+
+    GpuBuffer<float> a(4);
+    float* orig_ptr = a.data();
+    printf("2) 创建 a(4): a.data = %p, a.size = %zu\n", (void*)a.data(), a.size());
+
+    // 移动构造：把 a 的显存转交给新对象 b（转交后 a 变成空指针）
+    GpuBuffer<float> b(std::move(a));
+    printf("3) 转交给 b 后: a.data = %p, a.size = %zu | b.data = %p, b.size = %zu (地址没变: %s)\n",
+           (void*)a.data(), a.size(), (void*)b.data(), b.size(),
+           (b.data() == orig_ptr && a.data() == nullptr) ? "是" : "否");
+
+    // 移动赋值：把 b 的显存转交给已有对象 c（c 原本的 2 个元素显存会被自动先释放）
+    GpuBuffer<float> c(2);
+    c = std::move(b);
+    printf("4) 转交给 c 后: b.data = %p, b.size = %zu | c.data = %p, c.size = %zu\n",
+           (void*)b.data(), b.size(), (void*)c.data(), c.size());
+
+    // 自移动测试：自己转给自己 c = std::move(c)，指针依然完好
+    c = std::move(c);
+    printf("5) 自己转给自己后: c.data = %p, c.size = %zu (依然完好: %s)\n",
+           (void*)c.data(), c.size(), (c.data() == orig_ptr && c.size() == 4) ? "是" : "否");
+
+    // ================= 实验 2：测试 CUDA Stream 异步流水线 =================
+    printf("\n=== 实验 2：测试 CUDA Stream 异步流水线 ===\n");
+    cudaStream_t stream;
+    cuda_check(cudaStreamCreate(&stream)); // 创建一条异步流
+
+    const int N = 1025; // 1024 + 1，故意留 1 个余数测尾部边界
+    GpuBuffer<float> d_arr(N);
+    GpuBuffer<int> d_status(1);
+    std::vector<float> h_arr(N, 0.0f);
+
+    // 先测一次 n = 0 空数组，确认不会报错崩溃
+    run_pipeline_async(d_arr.data(), d_status.data(), 0, stream);
+
+    // 再测正式的 N = 1025：依次在 stream 中执行 a[i] = i，再执行 a[i] = a[i] * 2 + 10
+    run_pipeline_async(d_arr.data(), d_status.data(), N, stream);
+
+    // 把算好的结果放进同一个 stream 排队异步拷回 CPU
+    cuda_check(cudaMemcpyAsync(h_arr.data(), d_arr.data(), N * sizeof(float),
+                               cudaMemcpyDeviceToHost, stream));
+
+    // 关键一步：CPU 去读 h_arr 之前，必须等这条 stream 流水线里的活全部干完！
+    cuda_check(cudaStreamSynchronize(stream));
+
+    printf("流水线计算结果: h_arr[0] = %.1f (期望 10.0), h_arr[1024] = %.1f (期望 2058.0)\n",
+           h_arr[0], h_arr[1024]);
+
+    cuda_check(cudaStreamDestroy(stream)); // 销毁异步流
+    return 0; // main 函数结束，d_arr、d_status、c 自动触发 ~GpuBuffer() 释放显存！
+}
+```
+
+3. 编译并运行：
+
+```bash
+cmake -S /root -B /root/build
+cmake --build /root/build
+/root/build/07_raii_stream
+```
+
+## 深入原理与避坑剖析（跑通代码后再看这 4 个问题）
+
+1. **直接复制这个显存指针会出什么问题？移动时转交了什么？**
+   - 如果允许直接复制对象（`GpuBuffer b = a;`），C++ 默认只会把指针地址 `ptr_` 的数字抄一份给 `b`（浅拷贝），不会去 GPU 新开显存。此时 `a` 和 `b` 指向同一块显存：一方面通过其中一个修改数据会污染另一个；更致命的是当其中一个对象先析构调 `cudaFree` 后，另一个对象的指针就变成了悬垂指针（Use-After-Free），等第二个对象析构时又会对同一地址调第二次 `cudaFree`（重复释放 Double-Free）导致崩溃。
+   - 移动（`std::move`）时，只是在 CPU 上把指针地址 `ptr_` 和长度 `count_` 的所有权转交给新对象，同时把原对象的 `ptr_` 置为 `nullptr`、`count_` 置为 `0`，不需要搬动 GPU 显存里的任何数据，始终保证一块显存只有一个对象负责释放。
+2. **同一条 `cudaStream_t` 如何安排先后顺序？CPU 读取结果前需要什么同步？**
+   - 同一条 `cudaStream_t` 内部是严格按提交顺序排队执行的（FIFO）：前一个操作（如 `cudaMemsetAsync` 或前一个核函数）在 GPU 上彻底完成后，后一个核函数或 `cudaMemcpyAsync` 才会开始，中间不需要 CPU 同步。
+   - 但核函数启动与异步拷贝对 CPU 都是立即返回的，所以 CPU 在读取主机内存结果前，必须调用 `cudaStreamSynchronize(stream)` 或 `cudaDeviceSynchronize()`（或者使用同步版 `cudaMemcpy`）等待 GPU 完成。
+3. **如果异步任务引用了 `GpuBuffer` 对象，什么时候才能安全地销毁它？**
+   - 必须等**引用该缓冲区的所有异步核函数和异步传输全部执行完毕（即完成流同步或设备同步）之后**，才能销毁 `GpuBuffer` 对象。如果异步任务还在流中排队或正在 GPU 上执行时就提前析构 `GpuBuffer` 调用了 `cudaFree`，GPU 将会读写已释放的显存，触发非法内存访问。
+4. **为什么 `n == 0` 时既不申请显存，也不启动核函数？**
+   - 空对象 `n == 0` 不需要占用显存，直接保持 `ptr_ = nullptr` 最安全；而在启动核函数时，若 `n == 0` 算出的 `grid` 为 `0`，启动 `<<<0, block>>>` 会触发 `cudaErrorInvalidConfiguration` 错误，因此遇到 `n == 0` 应直接返回，不启动核函数。
+
+
+
