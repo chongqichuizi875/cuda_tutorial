@@ -1263,13 +1263,13 @@ CPU 顺序累加标准答案: 30075.328125
 
 ## 动手写 `07_raii_stream.cu`
 
-1. 先在 `h20-247` 上打开 `vim /root/CMakeLists.txt`，在文件末尾加一行：
+1. 先在 GPU 机器上打开 `vim /root/cuda_tutorial/CMakeLists.txt`，在文件末尾加一行：
 
 ```cmake
 add_executable(07_raii_stream 07_raii_stream.cu)
 ```
 
-2. 打开 `vim /root/07_raii_stream.cu`，敲入下面的代码（所有新语法的解释都直接写在了对应代码行的上方注释里，不用上下翻页对照）：
+2. 打开 `vim /root/cuda_tutorial/07_raii_stream.cu`，敲入下面的代码（所有新语法的解释都直接写在了对应代码行的上方注释里，不用上下翻页对照）：
 
 ```cpp
 #include <cuda_runtime.h>
@@ -1469,9 +1469,9 @@ int main() {
 3. 编译并运行：
 
 ```bash
-cmake -S /root -B /root/build
-cmake --build /root/build
-/root/build/07_raii_stream
+cmake -S /root/cuda_tutorial -B /root/cuda_tutorial/build
+cmake --build /root/cuda_tutorial/build
+/root/cuda_tutorial/build/07_raii_stream
 ```
 
 ## 深入原理与避坑剖析（跑通代码后再看这 4 个问题）
@@ -1500,7 +1500,7 @@ cmake --build /root/build
 
 ## 动手写 `08_atomic_compact.cu`
 
-1. 先在 `h20-247` 上打开 `vim /root/cuda_tutorial/CMakeLists.txt`，在文件末尾加一行：
+1. 先在 GPU 机器上打开 `vim /root/cuda_tutorial/CMakeLists.txt`，在文件末尾加一行：
 
 ```cmake
 add_executable(08_atomic_compact 08_atomic_compact.cu)
