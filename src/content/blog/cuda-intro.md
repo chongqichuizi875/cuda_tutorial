@@ -1679,6 +1679,221 @@ cmake --build /root/cuda_tutorial/build
    - **同一 `stream` 内部**：把填充核函数、`cudaMemsetAsync(count, 0, ...)` 和筛选核函数都放进同一个 `cudaStream_t stream`，CUDA 硬件会保证同一条流内的操作严格按提交顺序（FIFO）依次执行——必须等前一个核函数或清零操作在 GPU 上彻底完成后，后一个核函数才会开始执行，中间无需 CPU 同步。
    - **CPU 读取前**：因为核函数启动和异步操作对 CPU 都是立即返回的，CPU 在读取主机侧的 `count` 或 `out` 结果之前，必须调用 `cudaStreamSynchronize(stream)` 或 `cudaDeviceSynchronize()`（或使用同步版 `cudaMemcpy`）等待流中任务全部完成。
 
+---
+
+# 第九关：用排他前缀和（Exclusive Scan）实现保序并行筛选
+
+在第 8 关里，我们用 `atomicAdd(count, 1)` 实现了并行条件筛选，但它有一个明显的副作用：**谁先抢到原子计数器，谁就先写进输出数组，导致输出元素的先后顺序被彻底打乱了**。
+
+如果业务要求**筛选出来的非负数必须严格保持它们在原数组里的先后顺序**（例如输入 `{-2, 0, 3, -1, 3}`，输出必须是 `{0, 3, 3}`，且不能靠事后排序糊弄），GPU 该怎么在成千上万个线程同时干活的前提下，让每个线程精确算出自己应该写到 `out` 的第几个格子？答案就是 GPU 并行算法中最经典的「三步流压缩法（Mark $\rightarrow$ Scan $\rightarrow$ Scatter）」：
+
+1. **第一步 Mark（打标记）**：每个线程检查 `a[i]`，需要保留的在 `flags[i]` 写 `1`，丢弃的写 `0`。
+2. **第二步 Exclusive Scan（排他前缀和）**：对 `flags` 做排他前缀和得到 `offsets`，让 `offsets[i]` 等于「下标 `i` 前面一共有多少个 `1`」——既然我前面有 `offsets[i]` 个元素被保留，那我在输出数组 `out` 里的座位号就必然是 `offsets[i]`！
+3. **第三步 Scatter（按址搬运）**：所有 `flags[i] == 1` 的线程直接把 `a[i]` 写进 `out[offsets[i]]`，并由最后一个元素的 `offsets[n - 1] + flags[n - 1]` 直接得出总个数 `*count`。
+
+```text
+下标 i       :    0     1     2     3     4
+输入 a[i]    : [ -2,    0,    3,   -1,    3 ]
+                  │     │     │     │     │
+1. Mark      : [  0,    1,    1,    0,    1 ]  <-- flags[i]：非负标 1，负数标 0
+                  │     │     │     │     │
+2. Excl Scan : [  0,    0,    1,    2,    2 ]  <-- offsets[i] = flags[0] + ... + flags[i-1]
+                        │     │           │        （即“我前面有几个 1”，正好是写入下标！）
+3. Scatter   :          ▼     ▼           ▼
+   out[...]  :       out[0]=0 out[1]=3  out[2]=3  --> out = { 0, 3, 3 }
+   *count    : offsets[4] + flags[4] = 2 + 1 = 3
+```
+
+## 动手写 `09_scan_compact.cu`
+
+1. 先在 GPU 机器上打开 `vim /root/cuda_tutorial/CMakeLists.txt`，在文件末尾加一行：
+
+```cmake
+add_executable(09_scan_compact 09_scan_compact.cu)
+```
+
+2. 打开 `vim /root/cuda_tutorial/09_scan_compact.cu`，敲入下面的代码（所有新语法的解释都直接写在了对应代码行的上方注释里，不用上下翻页对照）：
+
+```cpp
+#include <cuda_runtime.h>
+#include <thrust/scan.h>
+#include <thrust/system/cuda/execution_policy.h>
+#include <cstdio>
+#include <stdexcept>
+#include <vector>
+
+inline void cuda_check(cudaError_t status) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(status));
+    }
+}
+
+// ==================== 第一步：标记核函数 (Mark) ====================
+// 每个线程检查自己负责的元素 a[i]：
+//   - 如果 a[i] >= 0.0f（需要保留），就在 flags[i] 写 1；
+//   - 如果 a[i] <  0.0f（需要丢弃），就在 flags[i] 写 0。
+// 例如输入 a     = {-2, 0, 3, -1, 3}
+// 跑完得到 flags = { 0, 1, 1,  0, 1}
+__global__ void mark_nonneg_kernel(const float* a, int* flags, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (int i = tid; i < n; i += stride) {
+        if (a[i] >= 0.0f) {
+            flags[i] = 1;
+        } else {
+            flags[i] = 0;
+        }
+    }
+}
+
+// ==================== 第三步：按址搬运核函数 (Scatter) ====================
+// 经过第二步的排他前缀和后，offsets[i] 里存的正好是「下标 i 前面一共有多少个 1」，
+// 也就是当前元素 a[i] 在输出数组 out 里的专属写入下标！
+//   - 如果 flags[i] == 1，直接把 a[i] 写进 out[offsets[i]]，无需任何原子操作，天然保序且绝不撞车！
+//   - 总共保留了多少个元素怎么算？
+//     看最后一个位置 n - 1：它前面有 offsets[n - 1] 个保留元素，再加上它自己是否保留 flags[n - 1]，
+//     所以总个数就是 offsets[n - 1] + flags[n - 1]！我们让处理 i == n - 1 的那个线程顺手写进 *count 即可。
+__global__ void scatter_keep_order_kernel(const float* a, float* out,
+                                          const int* flags, const int* offsets,
+                                          int* count, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (int i = tid; i < n; i += stride) {
+        if (flags[i] == 1) {
+            int pos = offsets[i];
+            out[pos] = a[i];
+        }
+        if (i == n - 1) {
+            *count = offsets[n - 1] + flags[n - 1];
+        }
+    }
+}
+
+// ==================== 主机端流水线包装函数：三步保序筛选 ====================
+void filter_stable_async(const float* d_a, float* d_out, int* d_count,
+                         int* d_flags, int* d_offsets, int n,
+                         cudaStream_t stream) {
+    // 边界保护：如果输入为空数组 (n <= 0)，后面不会启动 scatter_kernel，
+    // 所以必须在这里用 cudaMemsetAsync 把计数器 d_count 在 stream 里清零为 0，然后直接返回！
+    if (n <= 0) {
+        cuda_check(cudaMemsetAsync(d_count, 0, sizeof(int), stream));
+        return;
+    }
+
+    int block = 256;
+    int grid = (n - 1) / block + 1;
+
+    // 第 1 步：在 stream 中启动标记核函数，算出 0/1 标记数组 d_flags
+    mark_nonneg_kernel<<<grid, block, 0, stream>>>(d_a, d_flags, n);
+    cuda_check(cudaGetLastError());
+
+    // 第 2 步：调用 Thrust 的排他前缀和 exclusive_scan，根据 d_flags 算出写入下标数组 d_offsets。
+    // 语法拆解：
+    //   - thrust::cuda::par.on(stream) 叫「CUDA 流执行策略」：
+    //     告诉 Thrust 必须在 GPU 上并行计算，并且把任务塞进我们指定的这条 stream 流水线里排队
+    //     （等第 1 步 mark_nonneg_kernel 算完 flags 后再扫，扫完再跑第 3 步）。
+    //   - d_flags, d_flags + n：输入范围的【起点指针】和【终点指针】（共 n 个元素）。
+    //   - d_offsets：输出数组的【起点指针】。
+    //   - 什么是「排他前缀和（exclusive_scan）」？
+    //     就是第 i 项只累加它【前面】的 flags[0 .. i-1]，不包含 flags[i] 自己（第 0 项前面没元素，所以 offsets[0] 恒为 0）。
+    thrust::exclusive_scan(thrust::cuda::par.on(stream),
+                           d_flags, d_flags + n, d_offsets);
+
+    // 第 3 步：在同一个 stream 中启动搬运核函数，把保留元素按序写进 d_out，并由末尾线程算出 *d_count
+    scatter_keep_order_kernel<<<grid, block, 0, stream>>>(
+        d_a, d_out, d_flags, d_offsets, d_count, n);
+    cuda_check(cudaGetLastError());
+}
+
+int main() {
+    cudaStream_t stream;
+    cuda_check(cudaStreamCreate(&stream));
+
+    // 用一个一目了然的 5 元素数组验证三步全过程
+    std::vector<float> h_a = {-2.0f, 0.0f, 3.0f, -1.0f, 3.0f};
+    const int N = (int)h_a.size();
+
+    float *d_a = nullptr, *d_out = nullptr;
+    int *d_count = nullptr, *d_flags = nullptr, *d_offsets = nullptr;
+    cuda_check(cudaMalloc(&d_a, N * sizeof(float)));
+    cuda_check(cudaMalloc(&d_out, N * sizeof(float)));
+    cuda_check(cudaMalloc(&d_count, sizeof(int)));
+    cuda_check(cudaMalloc(&d_flags, N * sizeof(int)));
+    cuda_check(cudaMalloc(&d_offsets, N * sizeof(int)));
+
+    cuda_check(cudaMemcpyAsync(d_a, h_a.data(), N * sizeof(float), cudaMemcpyHostToDevice, stream));
+
+    // 连续调用两次（中间还穿插一次 n = 0 测试），验证状态完全覆盖、无需每次手动清零 count
+    filter_stable_async(d_a, d_out, d_count, d_flags, d_offsets, 0, stream);
+    filter_stable_async(d_a, d_out, d_count, d_flags, d_offsets, N, stream);
+    filter_stable_async(d_a, d_out, d_count, d_flags, d_offsets, N, stream);
+
+    // 拷回中间数组 flags、offsets 以及最终的 count 和 out，直观打印每一步的结果
+    std::vector<int> h_flags(N), h_offsets(N);
+    std::vector<float> h_out(N);
+    int h_count = -1;
+
+    cuda_check(cudaMemcpyAsync(h_flags.data(), d_flags, N * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    cuda_check(cudaMemcpyAsync(h_offsets.data(), d_offsets, N * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    cuda_check(cudaMemcpyAsync(&h_count, d_count, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    cuda_check(cudaMemcpyAsync(h_out.data(), d_out, N * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    cuda_check(cudaStreamSynchronize(stream));
+
+    printf("输入数组 a      : { %.0f, %.0f, %.0f, %.0f, %.0f }\n",
+           h_a[0], h_a[1], h_a[2], h_a[3], h_a[4]);
+    printf("第 1 步 flags   : { %2d, %2d, %2d, %2d, %2d } (1 代表保留，0 代表丢弃)\n",
+           h_flags[0], h_flags[1], h_flags[2], h_flags[3], h_flags[4]);
+    printf("第 2 步 offsets : { %2d, %2d, %2d, %2d, %2d } (我前面有几个保留元素 = 我的写入下标)\n",
+           h_offsets[0], h_offsets[1], h_offsets[2], h_offsets[3], h_offsets[4]);
+    printf("第 3 步 count   : offsets[4](%d) + flags[4](%d) = %d\n",
+           h_offsets[N - 1], h_flags[N - 1], h_count);
+    printf("保序输出 out    : { %.0f, %.0f, %.0f } (期望 { 0, 3, 3 })\n",
+           h_out[0], h_out[1], h_out[2]);
+
+    cudaFree(d_a);
+    cudaFree(d_out);
+    cudaFree(d_count);
+    cudaFree(d_flags);
+    cudaFree(d_offsets);
+    cudaStreamDestroy(stream);
+    return 0;
+}
+```
+
+3. 编译并运行：
+
+```bash
+cmake -S /root/cuda_tutorial -B /root/cuda_tutorial/build
+cmake --build /root/cuda_tutorial/build
+/root/cuda_tutorial/build/09_scan_compact
+```
+
+## 深入原理与避坑剖析（跑通代码后再看这 3 个问题）
+
+1. **手算一遍 `a = {-2, 0, 3, -1, 3}` 的每一步数组：为什么排他前缀和算出来的正好是写入下标？**
+   - **第 1 步（打标记 `flags`）**：把大于等于 `0` 的位置标为 `1`，负数标为 `0`，得到 `flags = {0, 1, 1, 0, 1}`。
+   - **第 2 步（排他前缀和 `offsets`）**：`offsets[i]` 只加 `i` 左边的 `flags[0 .. i-1]`（不含自己）：
+     - `offsets[0] = 0`（左边没有元素）
+     - `offsets[1] = flags[0] = 0`
+     - `offsets[2] = flags[0] + flags[1] = 0 + 1 = 1`
+     - `offsets[3] = flags[0] + flags[1] + flags[2] = 0 + 1 + 1 = 2`
+     - `offsets[4] = flags[0] + flags[1] + flags[2] + flags[3] = 0 + 1 + 1 + 0 = 2`
+     所以 `offsets = {0, 0, 1, 2, 2}`。
+   - **第 3 步（写出 `out` 与总个数 `count`）**：只看 `flags[i] == 1` 的三个位置（下标 `1, 2, 4`）：
+     - `i = 1`（值为 `0`）：写入 `out[offsets[1]] = out[0] = 0`；
+     - `i = 2`（值为 `3`）：写入 `out[offsets[2]] = out[1] = 3`；
+     - `i = 4`（值为 `3`）：写入 `out[offsets[4]] = out[2] = 3`；
+     最终 `out = {0, 3, 3}`，总个数 `count = offsets[4] + flags[4] = 2 + 1 = 3`。
+2. **为什么两个保留的元素绝不会写到同一个位置？它和第 8 关的原子筛选有什么区别？**
+   - **为什么绝不重叠写入**：设任意两个保留元素的下标满足 `i < j`（即 `flags[i] == 1` 且 `flags[j] == 1`）。因为 `offsets[j]` 是前 `j` 项的非负累加，里面比 `offsets[i]` 至少多加了一项 `flags[i] = 1`，所以必有 `offsets[j] >= offsets[i] + 1 > offsets[i]`。也就是说，所有保留位置的 `offsets` 是严格单调递增的 `0, 1, 2, ...`，每个保留元素都有唯一对应的写入槽位，绝不会写到同一位置。
+   - **与第 8 关原子筛选的区别**：第 8 关用 `atomicAdd` 领号时，槽位顺序取决于硬件 Warp/Block 谁先抢到原子指令，因此输出顺序是随机打乱的；而本关通过排他前缀和预先算好了确定的递增偏移量 `offsets[i]`，即使核函数里第 4 号线程比第 1 号线程先执行写入，第 4 号线程写的也是 `out[2]`、第 1 号线程写的也是 `out[0]`，最终输出顺序与输入顺序 100% 一致（稳定筛选）。
+3. **为什么总个数等于 `offsets[n - 1] + flags[n - 1]`，且不用在每次筛选前先把 `count` 清零？**
+   - 因为排他前缀和的定义是 `offsets[n - 1] = flags[0] + flags[1] + ... + flags[n - 2]`（前 `n - 1` 个元素里保留的个数），此时唯一没算进去的就是最后一个元素自己的标记 `flags[n - 1]`。把两者相加，正好等于全部 `n` 个元素里 `1` 的总和。
+   - 当 `n > 0` 时，最后一个线程 `i == n - 1` 会用赋值语句 `*count = offsets[n - 1] + flags[n - 1];` 直接覆盖掉 `*count` 的旧值（不是 `+=` 累加），所以哪怕全负数（算出 `0 + 0 = 0`）、全零（算出 `(n - 1) + 1 = n`）或连续重复调用，结果都天然正确；唯独当 `n == 0` 时核函数不启动，才需要单独用 `cudaMemsetAsync(count, 0, sizeof(int), stream)` 把 `*count` 设为 `0`。
+
+
 
 
 
