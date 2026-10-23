@@ -1,0 +1,207 @@
+---
+import BaseLayout from './BaseLayout.astro';
+
+interface Props {
+  title: string;
+  subtitle?: string;
+  description?: string;
+  pubDate: Date;
+  dateRange?: string;
+  tags?: string[];
+}
+const { title, subtitle, description, pubDate, dateRange, tags = [] } = Astro.props;
+const dateStr = pubDate.toISOString().slice(0, 10);
+const displayDate = dateRange ?? dateStr;
+---
+
+<BaseLayout title={title} description={description}>
+  <div class="post-shell">
+    <main class="post-main">
+      <article>
+        <header class="post-header">
+          <div class="post-meta">
+            <time datetime={dateStr}>{displayDate}</time>
+            {tags.length > 0 && (
+              <span class="tags">
+                {tags.map((t) => <span class="tag">{t}</span>)}
+              </span>
+            )}
+          </div>
+          <h1>{title}</h1>
+          {subtitle && <p class="subtitle">{subtitle}</p>}
+        </header>
+        <div class="post-body" id="post-content">
+          <slot />
+        </div>
+      </article>
+    </main>
+
+    <aside class="toc-sidebar" aria-label="文章目录">
+      <div class="toc-card">
+        <div class="toc-title">目录导航</div>
+        <nav id="toc-nav" class="toc-nav"></nav>
+      </div>
+    </aside>
+  </div>
+</BaseLayout>
+
+<script>
+  import mermaid from 'mermaid';
+
+  function isDark() {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+
+  // 1. 为代码块添加精致的顶栏（区分源码 / 终端命令 / 输出结果）+ 一键复制按钮
+  function enhanceCodeBlocks() {
+    const langLabels: Record<string, { label: string; kind: string }> = {
+      cuda: { label: 'CUDA C++ (.cu)', kind: 'source' },
+      cpp: { label: 'CUDA C++ (.cu)', kind: 'source' },
+      c: { label: 'C', kind: 'source' },
+      cmake: { label: 'CMakeLists.txt', kind: 'config' },
+      bash: { label: 'Shell 终端命令', kind: 'shell' },
+      sh: { label: 'Shell 终端命令', kind: 'shell' },
+      output: { label: 'Terminal Output · 运行输出', kind: 'output' },
+      diagram: { label: '硬件调度示意图', kind: 'diagram' },
+      text: { label: 'Output / 文本', kind: 'output' },
+      plaintext: { label: 'Output / 文本', kind: 'output' },
+    };
+
+    document.querySelectorAll('.post-body pre').forEach((pre) => {
+      if (pre.parentElement?.classList.contains('code-frame')) return;
+      const rawLang = (pre.getAttribute('data-language') || 'text').toLowerCase();
+      const codeText = pre.textContent || '';
+
+      // 自动识别纯输出块 vs 命令块
+      let info = langLabels[rawLang] || { label: rawLang.toUpperCase(), kind: 'source' };
+      if (rawLang === 'bash' || rawLang === 'text' || rawLang === 'plaintext') {
+        if (
+          codeText.startsWith('===') ||
+          codeText.startsWith('# 手动执行') ||
+          codeText.startsWith('# 部分输出') ||
+          codeText.startsWith('nvcc: NVIDIA') ||
+          codeText.startsWith('g++ (GCC)') ||
+          codeText.startsWith('(torch-base)') ||
+          codeText.startsWith('CPU 顺序累加标准答案')
+        ) {
+          info = langLabels.output;
+        } else if (codeText.startsWith('总线程数 stride =')) {
+          info = langLabels.diagram;
+        }
+      }
+
+      const wrapper = document.createElement('div');
+      wrapper.className = `code-frame kind-${info.kind}`;
+
+      const header = document.createElement('div');
+      header.className = 'code-header';
+
+      const left = document.createElement('div');
+      left.className = 'code-header-left';
+      left.innerHTML = `<span class="code-dots"><i></i><i></i><i></i></span><span class="code-lang-badge">${info.label}</span>`;
+
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'code-copy-btn';
+      copyBtn.type = 'button';
+      copyBtn.textContent = '复制';
+      copyBtn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(codeText.trimEnd());
+          copyBtn.textContent = '已复制 ✓';
+          copyBtn.classList.add('copied');
+          setTimeout(() => {
+            copyBtn.textContent = '复制';
+            copyBtn.classList.remove('copied');
+          }, 1800);
+        } catch {
+          copyBtn.textContent = '复制失败';
+        }
+      });
+
+      header.appendChild(left);
+      header.appendChild(copyBtn);
+      pre.replaceWith(wrapper);
+      wrapper.appendChild(header);
+      wrapper.appendChild(pre);
+    });
+  }
+
+  // 2. 自动生成右侧浮动目录（TOC）并支持滚动高亮
+  function buildTOC() {
+    const tocNav = document.getElementById('toc-nav');
+    const content = document.getElementById('post-content');
+    if (!tocNav || !content) return;
+
+    const headings = Array.from(content.querySelectorAll('h1, h2, h3'));
+    if (headings.length === 0) return;
+
+    headings.forEach((h, idx) => {
+      if (!h.id) {
+        h.id = `sec-${idx}`;
+      }
+      const a = document.createElement('a');
+      a.href = `#${h.id}`;
+      a.textContent = h.textContent || '';
+      a.className = `toc-link toc-${h.tagName.toLowerCase()}`;
+      tocNav.appendChild(a);
+    });
+
+    const links = Array.from(tocNav.querySelectorAll('.toc-link'));
+    const onScroll = () => {
+      let activeIdx = 0;
+      const offset = 110;
+      for (let i = 0; i < headings.length; i++) {
+        const rect = headings[i].getBoundingClientRect();
+        if (rect.top <= offset) {
+          activeIdx = i;
+        } else {
+          break;
+        }
+      }
+      links.forEach((l, i) => {
+        l.classList.toggle('active', i === activeIdx);
+      });
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+  }
+
+  // 3. 给所有表格套一层横向滚动容器
+  function wrapTables() {
+    document.querySelectorAll('.post-body table').forEach((table) => {
+      if (table.parentElement?.classList.contains('table-scroll')) return;
+      const wrapper = document.createElement('div');
+      wrapper.className = 'table-scroll';
+      table.replaceWith(wrapper);
+      wrapper.appendChild(table);
+    });
+  }
+
+  // 4. Mermaid 渲染
+  function renderMermaid() {
+    const blocks = document.querySelectorAll('code.language-mermaid, pre.language-mermaid > code');
+    if (blocks.length === 0) return;
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: isDark() ? 'dark' : 'default',
+      flowchart: { useMaxWidth: true, htmlLabels: true },
+      securityLevel: 'loose',
+    });
+    blocks.forEach((codeEl, i) => {
+      const pre = codeEl.closest('pre') ?? codeEl;
+      const source = codeEl.textContent ?? '';
+      const container = document.createElement('div');
+      container.className = 'mermaid';
+      container.id = `mermaid-${i}`;
+      pre.replaceWith(container);
+      mermaid.render(`mermaid-svg-${i}`, source).then(({ svg }) => {
+        container.innerHTML = svg;
+      });
+    });
+  }
+
+  wrapTables();
+  enhanceCodeBlocks();
+  buildTOC();
+  renderMermaid();
+</script>

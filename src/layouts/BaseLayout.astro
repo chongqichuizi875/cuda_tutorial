@@ -1,0 +1,43 @@
+---
+import '../styles/global.css';
+import 'katex/dist/katex.min.css';
+import { withBase } from '../utils/url';
+
+interface Props {
+  title: string;
+  description?: string;
+}
+const { title, description = 'CUDA 编程学习笔记与实验记录' } = Astro.props;
+---
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <link rel="icon" type="image/svg+xml" href={withBase('/favicon.svg')} />
+    <title>{title}</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href={withBase('/')}>
+          <span class="brand-badge">CUDA</span>
+          <span>sumailmao 的技术笔记</span>
+        </a>
+        <nav>
+          <a href={withBase('/')}>全部文章</a>
+        </nav>
+      </div>
+    </header>
+
+    <slot />
+
+    <footer class="site-footer">
+      <div class="wrap">
+        <p>CUDA Tutorial &amp; Hardware Experiments · NVIDIA H20 (Hopper sm_90, CUDA 12.9)</p>
+      </div>
+    </footer>
+  </body>
+</html>
