@@ -1493,18 +1493,20 @@ cmake --build /root/build
 
 在第 6 关里，我们用 `atomicAdd(&dev_sum, val)` 把所有线程的数加进同一个变量，当时我们只关心它能防数据竞争，**忽略了 `atomicAdd` 的返回值**。
 
-这一关我们要解决一个非常经典的 GPU 实战问题：**给定一个长度为 $N$ 的数组 `a`，先在 GPU 上用公式填满数据，再把其中所有满足条件（例如 $\ge 0$）的元素挑出来，紧凑地塞进输出数组 `out` 里，并统计一共挑出了多少个（记入 `count`）**。因为事先不知道哪些元素满足条件，没法提前给每个线程固定分配输出下标，我们就需要把 `atomicAdd(count, 1)` 当成一台**「硬件排队取号机」**来动态领槽位。
+如果现在换一个场景：成千上万个线程同时在数组 `a` 里找大于等于 `0` 的数，找到后要紧挨着塞进输出数组 `out` 里（中间不能留空洞）。因为事先不知道哪些位置满足条件，没法提前给每个线程固定分配输出下标。这一关我们写一个程序 `08_atomic_compact.cu`，完成两件具体的事：
+
+1. **用网格跨步循环填满任意长度的 GPU 数组**：无论数组长度 `n` 是多少（哪怕尾部不足一个 Block，或者 `n == 0`），都能安全填充且不漏掉尾部元素。
+2. **把 `int pos = atomicAdd(count, 1)` 当成「硬件排队取号机」做并行筛选**：每个满足条件的线程去原子计数器领一个独一无二的写入位置 `pos`，把保留下来的元素紧凑地写进 `out[pos]`，同时统计出总个数。
 
 ## 动手写 `08_atomic_compact.cu`
 
-1. 在 `/root/cuda_tutorial/CMakeLists.txt` 末尾加上第 7、8 关的可执行文件声明：
+1. 先在 `h20-247` 上打开 `vim /root/cuda_tutorial/CMakeLists.txt`，在文件末尾加一行：
 
 ```cmake
-add_executable(07_raii_stream 07_raii_stream.cu)
 add_executable(08_atomic_compact 08_atomic_compact.cu)
 ```
 
-2. 新建 `/root/cuda_tutorial/08_atomic_compact.cu`（如果你直接做考题，对应的是 `/root/cuda_tutorial/cuda-starter/q2_atomic/gpu_ops.cu`，语法和套路 100% 一一对应）：
+2. 打开 `vim /root/cuda_tutorial/08_atomic_compact.cu`，敲入下面的代码（所有新语法的解释都直接写在了对应代码行的上方注释里，不用上下翻页对照）：
 
 ```cpp
 #include <cuda_runtime.h>
@@ -1520,9 +1522,12 @@ inline void cuda_check(cudaError_t status) {
     }
 }
 
-// ==================== 核函数 1：用网格跨步循环填充数组 ====================
-// 每个线程从自己的全局编号 tid 出发，每次往前跳总线程数 stride，
-// 只要 i < n 就填入 cosf(float(i))（考题 Q2 填的是 sinf(float(i))）。
+// ==================== 1. 填充核函数：用网格跨步循环填入数据 ====================
+// 语法拆解：
+//   - tid 是当前线程的全局起点，stride 是整个网格的总线程数。
+//   - 用 for (int i = tid; i < n; i += stride) 让每个线程跨步处理多个元素，
+//     哪怕数组长度 n 比总线程数大得多，或者尾部不足一个 Block，也绝不会漏掉任何元素。
+//   - cosf(float(i))：先用 float(i) 把整数下标转成单精度浮点数，再调 GPU 单精度余弦函数 cosf。
 __global__ void fill_wave_kernel(float* a, int n) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -1532,46 +1537,46 @@ __global__ void fill_wave_kernel(float* a, int n) {
     }
 }
 
-// ==================== 核函数 2：用 atomicAdd「排队取号」筛选非负数 ====================
-// 核心语法：int pos = atomicAdd(count, 1);
-//   - atomicAdd(count, 1) 会在 GPU 硬件层面做两件事（不可打断）：
-//     1) 先读取 count 指针当前指向的旧整数值（比如 0），把这个【加之前的旧值】作为返回值赋给 pos；
-//     2) 再把显存里的 *count 加 1（变成 1）。
-//   - 就像银行大厅的排队叫号机：第 1 个按按钮的线程拿到号码 pos = 0，计数器变成 1；
-//     第 2 个按按钮的线程拿到号码 pos = 1，计数器变成 2……
-//   - 这样每个满足 a[i] >= 0.0f 的线程都能领到一个独一无二、绝不撞车的下标 pos，然后把 a[i] 写进 out[pos]！
+// ==================== 2. 筛选核函数：用 atomicAdd「排队取号」挑出非负数 ====================
+// 语法拆解：int pos = atomicAdd(count, 1);
+//   - atomicAdd(count, 1) 会在 GPU 硬件层面一口气做完两件事（中间绝不会被别的线程插队打断）：
+//     1) 先读取显存里 *count 当前的【旧值】（比如刚清零时是 0），并把这个【加之前的旧值】作为返回值赋给 pos；
+//     2) 紧接着把显存里的 *count 加上 1（变成 1）。
+//   - 就像银行大厅的排队叫号机：第 1 个按按钮的线程领到号码 pos = 0（同时计数器变成 1），
+//     第 2 个按按钮的线程领到号码 pos = 1（同时计数器变成 2）……
+//   - 这样每个满足 a[i] >= 0.0f 的线程都能领到一个独一无二、绝不撞车的槽位下标 pos，
+//     然后把当前元素 a[i] 本身写进 out[pos]！
 __global__ void filter_atomic_kernel(const float* a, float* out, int* count, int n) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
 
     for (int i = tid; i < n; i += stride) {
         if (a[i] >= 0.0f) {
-            int pos = atomicAdd(count, 1); // 原子领号：拿到专属槽位下标 pos，同时总人数 +1
-            out[pos] = a[i];               // 把当前元素本身写进专属槽位
+            int pos = atomicAdd(count, 1); // 1. 原子领号：拿到专属写入下标 pos，同时总个数 +1
+            out[pos] = a[i];               // 2. 把当前元素本身 a[i] 写入专属槽位 out[pos]
         }
     }
 }
 
-// ==================== 主机包装函数 1：异步启动填充 ====================
+// ==================== 3. 异步填充包装函数 ====================
 void fill_wave_async(float* d_a, int n, cudaStream_t stream) {
-    // 边界防御：n 为 0 时直接返回，绝不启动 <<<0, 256>>> 核函数
+    // 边界保护：n <= 0 时直接返回，千万不能往下走启动 <<<0, 256>>> 核函数！
     if (n <= 0) return;
 
     int block = 256;
-    int grid = (n - 1) / block + 1;
+    int grid = (n - 1) / block + 1; // 向上取整切分 Block
 
     fill_wave_kernel<<<grid, block, 0, stream>>>(d_a, n);
     cuda_check(cudaGetLastError()); // 检查核函数启动参数是否合法
 }
 
-// ==================== 主机包装函数 2：异步启动原子筛选 ====================
+// ==================== 4. 异步原子筛选包装函数 ====================
 void filter_atomic_async(const float* d_a, float* d_out, int* d_count,
                          int n, cudaStream_t stream) {
-    // 【极其关键的一步】：每次筛选开始前，必须在同一个 stream 里把计数器 d_count 清零！
-    // 为什么要放在 if (n <= 0) return; 的【前面】？
-    //   1) 如果调用方传入空数组 n == 0，期望读出来的元素个数也是 0；
-    //   2) 如果调用方拿着同一个 d_count 连续调用两次筛选函数（考题 tests.cu 就会连调 2 次！），
-    //      不清零就会在上一次的个数基础上继续累加，导致结果翻倍越界！
+    // 【关键一步】：每次筛选前，必须在同一个 stream 里用 cudaMemsetAsync 把计数器 d_count 清零！
+    // 为什么要把这句放在 if (n <= 0) return; 的【前面】？
+    //   1) 哪怕传入的是空数组 n == 0，也必须保证把 *d_count 清零成 0；
+    //   2) 如果外部拿着同一个 d_count 连续调用多次筛选函数，不清零就会在上一次的计数值上继续累加，导致结果翻倍越界！
     cuda_check(cudaMemsetAsync(d_count, 0, sizeof(int), stream));
 
     if (n <= 0) return;
@@ -1584,7 +1589,7 @@ void filter_atomic_async(const float* d_a, float* d_out, int* d_count,
 }
 
 int main() {
-    const int N = 1025; // 故意选 256 * 4 + 1，测试不足一个 Block 的尾部元素
+    const int N = 1025; // 256 * 4 + 1，故意留 1 个余数验证尾部边界
     cudaStream_t stream;
     cuda_check(cudaStreamCreate(&stream));
 
@@ -1595,20 +1600,20 @@ int main() {
     cuda_check(cudaMalloc(&d_out, N * sizeof(float)));
     cuda_check(cudaMalloc(&d_count, sizeof(int)));
 
-    // 同一条 stream 流水线：先填数据 -> 再连续跑两次筛选（验证第二次 count 不会翻倍）
+    // 在同一条 stream 流水线中：先填数据 -> 再连续跑两次筛选（验证第二次 count 不会翻倍）
     fill_wave_async(d_a, N, stream);
     filter_atomic_async(d_a, d_out, d_count, N, stream);
     filter_atomic_async(d_a, d_out, d_count, N, stream);
 
-    // 异步拷回计数器和筛选结果，然后等待 stream 全部执行完毕
+    // 异步拷回计数器和筛选结果，等待 stream 全部执行完毕
     int h_count = -1;
     std::vector<float> h_out(N);
     cuda_check(cudaMemcpyAsync(&h_count, d_count, sizeof(int), cudaMemcpyDeviceToHost, stream));
-    cuda_check(cudaStreamSynchronize(stream)); // 先等 h_count 拷回来
+    cuda_check(cudaStreamSynchronize(stream)); // 先等 h_count 拷回 CPU
     cuda_check(cudaMemcpyAsync(h_out.data(), d_out, h_count * sizeof(float), cudaMemcpyDeviceToHost, stream));
-    cuda_check(cudaStreamSynchronize(stream)); // 再等 h_out 拷回来
+    cuda_check(cudaStreamSynchronize(stream)); // 再等 h_out 拷回 CPU
 
-    // 在 CPU 上按同样规则算一份标准答案做对比
+    // 在 CPU 上按同样规则算一份标准答案做核对
     std::vector<float> expected;
     for (int i = 0; i < N; ++i) {
         float v = std::cos(float(i));
@@ -1622,7 +1627,7 @@ int main() {
     printf("  CPU 顺序前 5 个: %.4f, %.4f, %.4f, %.4f, %.4f\n",
            expected[0], expected[1], expected[2], expected[3], expected[4]);
 
-    // 排序后比对多重集是否完全一致
+    // 排序后比对元素集合与重复次数是否完全一致
     std::sort(h_out.begin(), h_out.begin() + h_count);
     std::sort(expected.begin(), expected.end());
     bool match = (h_count == (int)expected.size());
@@ -1639,48 +1644,41 @@ int main() {
 }
 ```
 
-## 深入原理与避坑剖析（对应考题 Q2 简答题）
+3. 编译并运行：
 
-### 1. 解剖典型错题 `broken`：短短 10 行代码藏了哪 4 处致命 Bug？
-
-看下面这段典型的错误核函数（考题 Q2 原题附带的反例）：
-
-```cpp
-__global__ void broken(int* a, int* out, int* count, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) return;
-    a[i] = sinf(i);
-    if (a[i] >= 0) {
-        int loc = *count;
-        *count += 1;
-        out[loc] = n;
-    }
-}
+```bash
+cmake -S /root/cuda_tutorial -B /root/cuda_tutorial/build
+cmake --build /root/cuda_tutorial/build
+/root/cuda_tutorial/build/08_atomic_compact
 ```
 
-逐行排查，一共 **4 处错误**：
-1. **下标边界条件写反（且缺跨步循环）**：
-   - `if (i < n) return;` 把所有合法下标 `0 <= i < n` 的线程全部直接退出了，反而让 `i >= n` 的越界线程继续往下跑并写显存，触发越界非法内存访问（Illegal Memory Access）。
-   - **正确写法**：单步模式下应写 `if (i >= n) return;`，或者改用网格跨步循环 `for (int i = tid; i < n; i += stride)`。
-2. **数组数值类型错误（精度截断）**：
-   - 参数 `a` 和 `out` 被声明成了整型指针 `int*`，而 `sinf(i)` 返回的是 `[-1.0f, 1.0f]` 之间的单精度浮点数 `float`。赋值给 `int` 会发生向零截断（几乎全变成 `0`），丢失所有小数。
-   - **正确写法**：`a` 和 `out` 的类型都必须是 `float*`，且传入 `sinf(float(i))`。
-3. **非原子计数引发严重数据竞争（Data Race）**：
-   - `int loc = *count; *count += 1;` 是普通显存读写。成百上千个满足条件的线程会同时读到同一个旧的 `*count` 值作为 `loc`，不仅把结果写进同一个 `out[loc]` 互相覆盖，还会导致最终 `*count` 远小于真实保留的元素个数。
-   - **正确写法**：用一条硬件原子加法指令 `int loc = atomicAdd(count, 1);` 同时完成「拿到独享旧下标 `loc`」和「计数器加 1」。
-4. **写入输出数组的值写错**：
-   - `out[loc] = n;` 把数组总长度 `n` 写进了输出数组，导致输出里装的全是常数 `n`。
-   - **正确写法**：应该写入当前线程筛出来的元素本身 `out[loc] = a[i];`。
+## 深入原理与避坑剖析（跑通代码后再看这 3 个问题）
 
-### 2. 为什么 `atomicAdd` 计数筛选能保证「个数和元素不丢」，却不能保证「输出顺序与原数组一致」？
+1. **初学者写并行填充与筛选时，为什么很容易写出下面这段「四处全错」的代码？**
+   看下面这段典型的错误核函数：
+   ```cpp
+   __global__ void broken(int* a, int* out, int* count, int n) {
+       int i = blockIdx.x * blockDim.x + threadIdx.x;
+       if (i < n) return;
+       a[i] = sinf(i);
+       if (a[i] >= 0) {
+           int loc = *count;
+           *count += 1;
+           out[loc] = n;
+       }
+   }
+   ```
+   - **坑 1（下标边界条件写反，且缺跨步循环）**：`if (i < n) return;` 把所有合法下标 `0 <= i < n` 的线程全部直接退出了，反而让 `i >= n` 的越界线程继续往下跑并写显存，触发越界非法访问；并且没有写网格跨步循环，当总线程数小于 `n` 时会漏掉后面的元素。单步应写 `if (i >= n) return;`，通用写法应为 `for (int i = tid; i < n; i += stride)`。
+   - **坑 2（数组数值类型写错，精度截断）**：参数 `a` 和 `out` 被声明成了整型指针 `int*`，而 `sinf(i)` 返回的是 `[-1.0f, 1.0f]` 的单精度浮点数 `float`，存入 `int` 会被直接向零截断成整数 `0`，丢失所有小数。应改为 `float*`。
+   - **坑 3（非原子计数引发严重数据竞争 Data Race）**：`int loc = *count; *count += 1;` 是无锁的普通显存读写。成百上千个满足条件的线程会同时读到同一个旧的 `*count` 值作为 `loc`，不仅把结果写进同一个 `out[loc]` 互相覆盖，还会导致最终 `*count` 远小于真实保留个数。应改为硬件原子指令 `int loc = atomicAdd(count, 1);`。
+   - **坑 4（写入输出数组的值写错）**：`out[loc] = n;` 把数组总长度 `n` 写进了输出数组，导致输出里装的全是常数 `n`。应改为写入当前筛出来的元素本身 `out[loc] = a[i];`。
+2. **为什么 `atomicAdd` 计数筛选能保证「个数和元素不丢」，却不能保证「输出顺序与原数组一致」？**
+   - **不丢不重的原因**：`atomicAdd(count, 1)` 在 GPU 硬件 L2 Cache 原子单元上是严格排队执行的，每次调用必定返回互不相同的旧整数 `0, 1, 2, ...`，因此每个满足条件的元素拿到的写入下标 `pos` 绝对唯一，绝不会撞车覆盖。
+   - **顺序打乱的原因**：正如第 2 关实测过的，不同 Block（跨 SM）以及同一 Block 内不同 Warp 之间的硬件调度顺序是不确定的。比如第 500 号线程所在的 Warp 可能比第 0 号线程所在的 Warp 更早冲到 `atomicAdd` 领走 `0` 号槽位，导致 `a[500]` 被写进 `out[0]`，而 `a[0]` 反而排到了后面。
+3. **把「填数组 $\rightarrow$ 清零计数器 $\rightarrow$ 原子筛选」放进同一条 `cudaStream_t` 时，先后依赖如何保证？CPU 读取结果前要等什么？**
+   - **同一 `stream` 内部**：把填充核函数、`cudaMemsetAsync(count, 0, ...)` 和筛选核函数都放进同一个 `cudaStream_t stream`，CUDA 硬件会保证同一条流内的操作严格按提交顺序（FIFO）依次执行——必须等前一个核函数或清零操作在 GPU 上彻底完成后，后一个核函数才会开始执行，中间无需 CPU 同步。
+   - **CPU 读取前**：因为核函数启动和异步操作对 CPU 都是立即返回的，CPU 在读取主机侧的 `count` 或 `out` 结果之前，必须调用 `cudaStreamSynchronize(stream)` 或 `cudaDeviceSynchronize()`（或使用同步版 `cudaMemcpy`）等待流中任务全部完成。
 
-- **不丢不重的原因**：`atomicAdd(count, 1)` 在硬件 L2 Cache 原子单元上是严格串行化排队的，每次调用必定返回互不相同的整数 `0, 1, 2, ..., k-1`，因此每个满足条件的线程拿到的写入位置 `pos` 绝对唯一，不会互相覆盖。
-- **乱序的原因**：正如我们在第 2 关实测过的，GPU 上不同 Block（分属不同 SM）以及同一 Block 内不同 Warp 之间的硬件调度和指令到达 L2 Cache 的先后顺序是**不确定（非确定性并发）**的。比如第 500 号线程所在的 Warp 可能比第 0 号线程所在的 Warp 更早执行到 `atomicAdd`，于是 `a[500]` 抢到了 `out[0]`，而 `a[0]` 反而被写到了后面的槽位。
-
-### 3. 同一 `stream` 中的先后依赖如何保证？CPU 读取结果前要等什么？
-
-- **同一 `stream` 内部**：在 `fill_sin`、`cudaMemsetAsync`、`filter_atomic` 中都传入同一个 `cudaStream_t stream`，CUDA 驱动和硬件会保证同一条流内的命令按提交先后顺序（FIFO）依次执行——必须等 `fill_kernel` 把数组全部填完、且 `cudaMemsetAsync` 把 `count` 清零完之后，`atomic_kernel` 才会开始读取 `a` 并累加 `count`。
-- **CPU 读取前**：由于核函数启动和 `cudaMemsetAsync` / `cudaMemcpyAsync` 对 CPU 都是异步非阻塞的，CPU 在去读主机内存里的 `count` 或 `out` 之前，必须调用 `cudaStreamSynchronize(stream)` 或 `cudaDeviceSynchronize()`（或者直接调用同步版 `cudaMemcpy`）等待该流中的所有 GPU 任务执行完毕。
 
 
 
