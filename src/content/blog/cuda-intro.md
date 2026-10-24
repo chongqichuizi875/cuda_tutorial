@@ -2201,6 +2201,466 @@ cmake --build /root/cuda_tutorial/build
    - **硬件资源受限与 SM 占用率（Occupancy）下降**：每个 SM 上的共享内存容量和寄存器总数是固定的，且单 Block 线程数上限为 1024（`32 × 32 = 1024` 已达硬上限，再大直接无法启动）。当分块变大时，单 Block 占用的共享内存（翻 4 倍）和线程数激增，导致每个 SM 能同时驻留并发执行的活跃 Block 数量减少，SM 占用率（Occupancy）下降，反而不利于隐藏访存与指令延迟。
    - **同步与小矩阵尾部浪费增加**：更大的线程块意味着每次 `__syncthreads()` 需要等待多达 1024 个线程（32 个 Warp）全部到齐，块内木桶效应更明显；且当矩阵尺寸较小时（如 `128 × 128`），总 Block 数过少无法铺满 GPU 的全部 SM，或者边缘非整倍数块的空闲线程浪费比例更高。
 
+---
+
+# 第十一关（收官之战）：GPU 精准计时、性能对比与内存消毒器（`compute-sanitizer`）
+
+在前 10 关里，我们已经写出了两条截然不同的实现路线：筛选问题有「第 8 关的 `atomicAdd` 原子筛选」和「第 9 关的 `exclusive_scan` 保序筛选」；矩阵乘法有「普通全局显存版 `naive`」和「第 10 关的共享内存分块版 `tiled`」。那到底哪个更快？快多少？在小数据量下“高级优化版”会不会反而比“普通版”更慢？
+
+要科学地回答这个问题，不能靠感觉，更不能直接拿 CPU 秒表包住一行 `kernel<<<...>>>()`（因为核函数启动是异步的，那样测出来的只是 CPU 花了几微秒把任务单塞进流里的时间，根本不是 GPU 算完的时间！）。这一关作为全套教程的收官之战，我们写一个完整的评测程序 `11_bench_sanitizer.cu`，掌握三项核心技能：
+
+1. **用两把不同的尺子精准测速（预热 1 次 + 正式测 5 次取中位数）**：
+   - **尺子 1（纯 GPU 操作耗时）**：在同一条 `stream` 内部用硬件事件 `cudaEvent_t` 打点，等结束事件 `cudaEventSynchronize(stop)` 完成后用 `cudaEventElapsedTime` 读取毫秒数；
+   - **尺子 2（含传输的端到端总耗时 E2E）**：用 CPU 的 `std::chrono::steady_clock`，从 CPU 向 GPU 拷入数据开始，到有效结果拷回 CPU 并 `cudaStreamSynchronize` 同步完成为止。
+2. **先验对错、再测性能**：在计时前先严格校验每个算子的输出元素、个数、顺序与浮点误差，打印出清晰的对账表格。
+3. **用官方内存消毒器 `compute-sanitizer --tool memcheck` 做全面体检**：哪怕程序表面输出了 `PASS`，只要核函数里有哪怕 1 个字节的越界读写或未对齐访问，都会被它当场揪出来。
+
+```text
+为什么不能直接用 CPU 秒表包住 kernel<<<...>>>() 来测核函数耗时？
+  CPU 时间线:  [t0] ──► 提交 kernel (仅花 3 微秒派单) ──► [t1]  <-- 测出来的只是“CPU 贴任务单”的时间！
+  GPU 流水线:                └──► [ 真正跑核函数 (比如 5 毫秒) ]
+
+正确的两把计时尺子：
+====================================================================================================
+【尺子 1：cudaEvent_t（GPU 流水线内部打点器 —— 只测纯 GPU 操作耗时）】
+  GPU stream 传送带:
+    ... ──► [ 打点 start ] ──► [ GPU 操作 run() ] ──► [ 打点 stop ] ──► (CPU 调用 cudaEventSynchronize(stop) 等待)
+            └────────────────── cudaEventElapsedTime(&ms, start, stop) ──────────────────┘
+            （由 GPU 硬件时钟直接记录，精准包含 stream 内提交的所有核函数与清零操作，不含 PCIe 拷数据）
+
+====================================================================================================
+【尺子 2：std::chrono::steady_clock（CPU 墙上挂钟 —— 测包含数据传输与等待的端到端 E2E 总耗时）】
+  CPU + GPU 端到端全流程:
+    [ CPU 记录 t0 ]
+          │
+          ├──► 1. H2D 传输：CPU 向 GPU 拷入输入数据 (cudaMemcpyAsync HostToDevice)
+          ├──► 2. GPU 计算：在 stream 中启动核函数 (清零 / 筛选 / 矩阵乘)
+          ├──► 3. D2H 传输：把 count 和有效结果拷回 CPU (cudaMemcpyAsync DeviceToHost)
+          ├──► 4. 同步等待：cudaStreamSynchronize(stream)  <-- 【铁律】停表前必须等 GPU 全部干完！
+          ▼
+    [ CPU 记录 t1 ]  ──► 端到端总耗时 ms = (t1 - t0)
+```
+
+## 动手写 `11_bench_sanitizer.cu`
+
+1. 先在 GPU 机器上打开 `vim /root/cuda_tutorial/CMakeLists.txt`，在文件末尾加一行：
+
+```cmake
+add_executable(11_bench_sanitizer 11_bench_sanitizer.cu)
+```
+
+2. 打开 `vim /root/cuda_tutorial/11_bench_sanitizer.cu`，敲入下面的代码（所有新语法的解释都直接写在了对应代码行的上方注释里，不用上下翻页对照）：
+
+```cpp
+#include <cuda_runtime.h>
+#include <thrust/scan.h>
+#include <thrust/system/cuda/execution_policy.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+
+inline void cuda_check(cudaError_t status) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(status));
+    }
+}
+
+// ==================== 1. RAII 封装：显存管家与 CUDA Event 打点器 ====================
+template <class T>
+class DeviceBuffer {
+    T* ptr_ = nullptr;
+    std::size_t count_ = 0;
+public:
+    explicit DeviceBuffer(std::size_t n) : count_(n) {
+        if (n > 0) cuda_check(cudaMalloc(reinterpret_cast<void**>(&ptr_), n * sizeof(T)));
+    }
+    ~DeviceBuffer() noexcept { if (ptr_) cudaFree(ptr_); }
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    DeviceBuffer(DeviceBuffer&& other) noexcept : ptr_(other.ptr_), count_(other.count_) {
+        other.ptr_ = nullptr;
+        other.count_ = 0;
+    }
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) cudaFree(ptr_);
+            ptr_ = other.ptr_;
+            count_ = other.count_;
+            other.ptr_ = nullptr;
+            other.count_ = 0;
+        }
+        return *this;
+    }
+    T* data() const noexcept { return ptr_; }
+    std::size_t size() const noexcept { return count_; }
+};
+
+// 用第 7 关同样的 RAII 思路封装 cudaEvent_t（GPU 流水线时间戳打点器）：
+// 构造时自动 cudaEventCreate，离开作用域析构时自动 cudaEventDestroy，且禁止拷贝。
+struct Event {
+    cudaEvent_t value{};
+    Event() { cuda_check(cudaEventCreate(&value)); }
+    ~Event() { cudaEventDestroy(value); }
+    Event(const Event&) = delete;
+    Event& operator=(const Event&) = delete;
+};
+
+// ==================== 2. 核心计时工具 1：用 CUDA Event 测纯 GPU 耗时的中位数 ====================
+// 语法拆解：
+//   - template <class F>：接收任意可调用的打包任务 run（比如我们在 main 里传入的 [&]() { ... } Lambda）。
+//   - 为什么要【预热 (Warm-up) 1 次】？
+//     因为 GPU 第一次跑某个核函数时，驱动需要做上下文初始化、PTX 即时编译或把指令加载进指令缓存，耗时虚高。
+//   - 为什么要【正式跑 5 次并排序取 times[2] 中位数】？
+//     因为硬件调度偶有抖动，把 5 次耗时从小到大 std::sort 排序后，正中间的第 3 个数（下标 2）就是中位数，完全不怕单次毛刺干扰！
+template <class F>
+float median_gpu_ms(F run, cudaStream_t stream) {
+    Event start, stop;
+    std::vector<float> times;
+
+    // 【第 1 步：预热 1 次，并等待预热彻底完成】
+    run();
+    cuda_check(cudaStreamSynchronize(stream));
+
+    // 【第 2 步：正式测量 5 次】
+    for (int r = 0; r < 5; ++r) {
+        // 1) 在 stream 流水线里插下起点旗子 start
+        cuda_check(cudaEventRecord(start.value, stream));
+        // 2) 调用 run()，往同一个 stream 里提交待测的 GPU 操作
+        run();
+        // 3) 在同一个 stream 流水线里插下终点旗子 stop
+        cuda_check(cudaEventRecord(stop.value, stream));
+
+        // 4) 【关键一步】必须等终点旗子 stop 在 GPU 上真正被跨过，才能读取耗时！
+        cuda_check(cudaEventSynchronize(stop.value));
+
+        // 5) 计算 start 到 stop 之间经过的 GPU 硬件毫秒数，存入 times
+        float ms = 0.0f;
+        cuda_check(cudaEventElapsedTime(&ms, start.value, stop.value));
+        times.push_back(ms);
+    }
+
+    // 【第 3 步：从小到大排序，返回正中间的中位数 times[2]】
+    std::sort(times.begin(), times.end());
+    return times[2];
+}
+
+// ==================== 3. 核心计时工具 2：用 steady_clock 测含传输的端到端总耗时 ====================
+// 语法拆解：
+//   - std::chrono::steady_clock::now()：C++17 标准库的单调递增高精度时钟（不会因为系统校准时间而倒退）。
+//   - std::chrono::duration<float, std::milli>(t1 - t0).count()：把两个时间点的差值换算成 float 类型的毫秒数 (ms)。
+//   - 端到端（End-to-End, E2E）包含：CPU->GPU 拷入 + GPU 计算 + GPU->CPU 拷出 + 同步等待。
+template <class F>
+float median_e2e_ms(F run_e2e) {
+    // 预热 1 次（run_e2e 内部末尾已包含同步等待）
+    run_e2e();
+
+    std::vector<float> times;
+    for (int r = 0; r < 5; ++r) {
+        auto t0 = std::chrono::steady_clock::now();
+        run_e2e(); // 执行完整的 H2D -> Kernel -> D2H -> Synchronize
+        auto t1 = std::chrono::steady_clock::now();
+
+        float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+        times.push_back(ms);
+    }
+    std::sort(times.begin(), times.end());
+    return times[2];
+}
+
+// ==================== 4. 把前几关的算子汇总进来做对比实验 ====================
+// (A) 第 8 关的原子筛选
+__global__ void atomic_filter_kernel(const float* a, float* out, int* count, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < n; i += stride) {
+        if (a[i] >= 0.0f) {
+            int pos = atomicAdd(count, 1);
+            out[pos] = a[i];
+        }
+    }
+}
+void filter_atomic(const float* a, float* out, int* count, int n, cudaStream_t stream) {
+    cuda_check(cudaMemsetAsync(count, 0, sizeof(int), stream));
+    if (n <= 0) return;
+    int block = 256, grid = (n - 1) / block + 1;
+    atomic_filter_kernel<<<grid, block, 0, stream>>>(a, out, count, n);
+    cuda_check(cudaGetLastError());
+}
+
+// (B) 第 9 关的保序前缀和筛选
+__global__ void mark_kernel(const float* a, int* flags, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < n; i += stride) flags[i] = (a[i] >= 0.0f) ? 1 : 0;
+}
+__global__ void scatter_kernel(const float* a, float* out, const int* flags,
+                               const int* offsets, int* count, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < n; i += stride) {
+        if (flags[i] == 1) out[offsets[i]] = a[i];
+        if (i == n - 1) *count = offsets[n - 1] + flags[n - 1];
+    }
+}
+void filter_stable(const float* a, float* out, int* count, int* flags, int* offsets,
+                   int n, cudaStream_t stream) {
+    if (n <= 0) {
+        cuda_check(cudaMemsetAsync(count, 0, sizeof(int), stream));
+        return;
+    }
+    int block = 256, grid = (n - 1) / block + 1;
+    mark_kernel<<<grid, block, 0, stream>>>(a, flags, n);
+    cuda_check(cudaGetLastError());
+    thrust::exclusive_scan(thrust::cuda::par.on(stream), flags, flags + n, offsets);
+    scatter_kernel<<<grid, block, 0, stream>>>(a, out, flags, offsets, count, n);
+    cuda_check(cudaGetLastError());
+}
+
+// (C) 第 10 关的普通矩阵乘法 vs 共享内存分块矩阵乘法
+__global__ void naive_gemm_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= M || col >= N) return;
+    float sum = 0.0f;
+    for (int k = 0; k < K; ++k) sum += A[row * K + k] * B[k * N + col];
+    C[row * N + col] = sum;
+}
+void gemm_naive(const float* A, const float* B, float* C, int M, int N, int K, cudaStream_t stream) {
+    if (M <= 0 || N <= 0) return;
+    dim3 grid((N - 1) / 16 + 1, (M - 1) / 16 + 1);
+    naive_gemm_kernel<<<grid, dim3(16, 16), 0, stream>>>(A, B, C, M, N, K);
+    cuda_check(cudaGetLastError());
+}
+
+__global__ void tiled_gemm_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    __shared__ float As[16][16], Bs[16][16];
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int row = blockIdx.y * 16 + ty, col = blockIdx.x * 16 + tx;
+    float sum = 0.0f;
+    for (int base = 0; base < K; base += 16) {
+        As[ty][tx] = (row < M && base + tx < K) ? A[row * K + base + tx] : 0.0f;
+        Bs[ty][tx] = (base + ty < K && col < N) ? B[(base + ty) * N + col] : 0.0f;
+        __syncthreads();
+        for (int t = 0; t < 16; ++t) sum += As[ty][t] * Bs[t][tx];
+        __syncthreads();
+    }
+    if (row < M && col < N) C[row * N + col] = sum;
+}
+void gemm_tiled(const float* A, const float* B, float* C, int M, int N, int K, cudaStream_t stream) {
+    if (M <= 0 || N <= 0) return;
+    dim3 grid((N - 1) / 16 + 1, (M - 1) / 16 + 1);
+    tiled_gemm_kernel<<<grid, dim3(16, 16), 0, stream>>>(A, B, C, M, N, K);
+    cuda_check(cudaGetLastError());
+}
+
+int main() {
+    // 1. 打印当前 GPU 硬件与运行环境信息
+    cudaDeviceProp prop{};
+    cuda_check(cudaGetDeviceProperties(&prop, 0));
+    int driver_ver = 0, runtime_ver = 0;
+    cuda_check(cudaDriverGetVersion(&driver_ver));
+    cuda_check(cudaRuntimeGetVersion(&runtime_ver));
+    printf("================ 环境信息 ================\n");
+    printf("GPU 型号: %s (SM 数量: %d, Compute Capability: %d.%d)\n",
+           prop.name, prop.multiProcessorCount, prop.major, prop.minor);
+    printf("Driver Version: %d, CUDA Runtime Version: %d\n\n", driver_ver, runtime_ver);
+
+    cudaStream_t stream;
+    cuda_check(cudaStreamCreate(&stream));
+
+    // ================ 实验组 1：对比 Atomic 筛选 vs Stable 筛选 ================
+    // 测量规范：先核对答案正确性，再分别测量【纯 GPU 耗时】与【含传输 E2E 总耗时】（缓冲区提前分配并复用，分配本身不计入时间）
+    printf("================ 实验 1：筛选算子对比 (Atomic vs Stable) ================\n");
+    printf("%-10s | %-13s | %-13s | %-13s | %-13s | %s\n",
+           "n", "atomic GPU ms", "stable GPU ms", "atomic E2E ms", "stable E2E ms", "count/正确性");
+    printf("------------------------------------------------------------------------------------------\n");
+
+    for (int n : {1025, 65537, 1048576}) {
+        // 统一生成输入数据 float(i % 7 - 3)，同时算出 CPU 标准答案 expected
+        std::vector<float> h_in(n), expected;
+        for (int i = 0; i < n; ++i) {
+            h_in[i] = float(i % 7 - 3);
+            if (h_in[i] >= 0.0f) expected.push_back(h_in[i]);
+        }
+
+        // 预先分配并复用 GPU 缓冲区（显存分配本身不计入计时）
+        DeviceBuffer<float> d_in(n), d_out(n);
+        DeviceBuffer<int> d_count(1), d_flags(n), d_offsets(n);
+        cuda_check(cudaMemcpyAsync(d_in.data(), h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice, stream));
+        cuda_check(cudaStreamSynchronize(stream));
+
+        // 1) 先核对 Atomic 筛选结果（比较个数与排序后的多重集）
+        filter_atomic(d_in.data(), d_out.data(), d_count.data(), n, stream);
+        int c_atomic = 0;
+        cuda_check(cudaMemcpyAsync(&c_atomic, d_count.data(), sizeof(int), cudaMemcpyDeviceToHost, stream));
+        cuda_check(cudaStreamSynchronize(stream));
+        std::vector<float> h_out_atomic(c_atomic);
+        cuda_check(cudaMemcpyAsync(h_out_atomic.data(), d_out.data(), c_atomic * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        cuda_check(cudaStreamSynchronize(stream));
+
+        std::vector<float> exp_sorted = expected;
+        std::sort(exp_sorted.begin(), exp_sorted.end());
+        std::sort(h_out_atomic.begin(), h_out_atomic.end());
+        bool atomic_ok = (c_atomic == (int)expected.size()) && (h_out_atomic == exp_sorted);
+
+        // 2) 再核对 Stable 筛选结果（直接逐项比对顺序与元素）
+        filter_stable(d_in.data(), d_out.data(), d_count.data(), d_flags.data(), d_offsets.data(), n, stream);
+        int c_stable = 0;
+        cuda_check(cudaMemcpyAsync(&c_stable, d_count.data(), sizeof(int), cudaMemcpyDeviceToHost, stream));
+        cuda_check(cudaStreamSynchronize(stream));
+        std::vector<float> h_out_stable(c_stable);
+        cuda_check(cudaMemcpyAsync(h_out_stable.data(), d_out.data(), c_stable * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        cuda_check(cudaStreamSynchronize(stream));
+        bool stable_ok = (c_stable == (int)expected.size()) && (h_out_stable == expected);
+
+        if (!atomic_ok || !stable_ok) {
+            throw std::runtime_error("Filter verification failed!");
+        }
+
+        // 3) 用 median_gpu_ms 测量纯 GPU 操作时间（包含 count 清零 / mark+scan+scatter 全部步骤）
+        //    注意：[&] 表示 Lambda 按引用捕获外面的缓冲区别名，只在 CPU 侧把调用语句打包传给 median_gpu_ms
+        float atomic_gpu = median_gpu_ms([&]() {
+            filter_atomic(d_in.data(), d_out.data(), d_count.data(), n, stream);
+        }, stream);
+
+        float stable_gpu = median_gpu_ms([&]() {
+            filter_stable(d_in.data(), d_out.data(), d_count.data(), d_flags.data(), d_offsets.data(), n, stream);
+        }, stream);
+
+        // 4) 用 steady_clock 测量包含传输与同步的端到端总耗时：
+        //    从 CPU 向 GPU 传入输入数据开始，到 count 和有效输出回到 CPU 并同步完成为止
+        std::vector<float> h_out_buf(n);
+        float atomic_e2e = median_e2e_ms([&]() {
+            cuda_check(cudaMemcpyAsync(d_in.data(), h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice, stream));
+            filter_atomic(d_in.data(), d_out.data(), d_count.data(), n, stream);
+            int cnt = 0;
+            cuda_check(cudaMemcpyAsync(&cnt, d_count.data(), sizeof(int), cudaMemcpyDeviceToHost, stream));
+            cuda_check(cudaStreamSynchronize(stream));
+            if (cnt > 0) {
+                cuda_check(cudaMemcpyAsync(h_out_buf.data(), d_out.data(), cnt * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                cuda_check(cudaStreamSynchronize(stream));
+            }
+        });
+
+        float stable_e2e = median_e2e_ms([&]() {
+            cuda_check(cudaMemcpyAsync(d_in.data(), h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice, stream));
+            filter_stable(d_in.data(), d_out.data(), d_count.data(), d_flags.data(), d_offsets.data(), n, stream);
+            int cnt = 0;
+            cuda_check(cudaMemcpyAsync(&cnt, d_count.data(), sizeof(int), cudaMemcpyDeviceToHost, stream));
+            cuda_check(cudaStreamSynchronize(stream));
+            if (cnt > 0) {
+                cuda_check(cudaMemcpyAsync(h_out_buf.data(), d_out.data(), cnt * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                cuda_check(cudaStreamSynchronize(stream));
+            }
+        });
+
+        printf("%-10d | %-13.4f | %-13.4f | %-13.4f | %-13.4f | count=%d (PASS)\n",
+               n, atomic_gpu, stable_gpu, atomic_e2e, stable_e2e, c_stable);
+    }
+
+    // ================ 实验组 2：对比 Naive 矩阵乘 vs Tiled 共享内存矩阵乘 ================
+    printf("\n================ 实验 2：矩阵乘法对比 (Naive vs Tiled) ================\n");
+    printf("%-13s | %-12s | %-12s | %-12s | %s\n",
+           "M,N,K", "naive ms", "tiled ms", "naive/tiled", "最大绝对误差");
+    printf("--------------------------------------------------------------------------------\n");
+
+    for (int sz : {128, 256}) {
+        int M = sz, N = sz, K = sz;
+        std::vector<float> h_A(M * K), h_B(K * N), h_C_ref(M * N), h_C_naive(M * N), h_C_tiled(M * N);
+        for (int i = 0; i < M * K; ++i) h_A[i] = float(i % 11 - 5) / 8.0f;
+        for (int i = 0; i < K * N; ++i) h_B[i] = float(i % 7 - 3) / 4.0f;
+
+        // CPU 双精度累加求参考真值
+        for (int r = 0; r < M; ++r) {
+            for (int c = 0; c < N; ++c) {
+                double s = 0.0;
+                for (int k = 0; k < K; ++k) s += double(h_A[r * K + k]) * double(h_B[k * N + c]);
+                h_C_ref[r * N + c] = float(s);
+            }
+        }
+
+        DeviceBuffer<float> d_A(M * K), d_B(K * N), d_C(M * N);
+        cuda_check(cudaMemcpyAsync(d_A.data(), h_A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice, stream));
+        cuda_check(cudaMemcpyAsync(d_B.data(), h_B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice, stream));
+
+        // 1) 先核对 Naive 和 Tiled 的计算误差是否满足 <= 1e-4 + 1e-4 * abs(ref)
+        gemm_naive(d_A.data(), d_B.data(), d_C.data(), M, N, K, stream);
+        cuda_check(cudaMemcpyAsync(h_C_naive.data(), d_C.data(), M * N * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        gemm_tiled(d_A.data(), d_B.data(), d_C.data(), M, N, K, stream);
+        cuda_check(cudaMemcpyAsync(h_C_tiled.data(), d_C.data(), M * N * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        cuda_check(cudaStreamSynchronize(stream));
+
+        float max_err = 0.0f;
+        for (int i = 0; i < M * N; ++i) {
+            float err_n = std::abs(h_C_naive[i] - h_C_ref[i]);
+            float err_t = std::abs(h_C_tiled[i] - h_C_ref[i]);
+            float tol = 1e-4f + 1e-4f * std::abs(h_C_ref[i]);
+            if (err_n > tol || err_t > tol) throw std::runtime_error("GEMM verification failed!");
+            max_err = std::max(max_err, std::max(err_n, err_t));
+        }
+
+        // 2) 测量两个 Kernel 的纯 GPU 时间并计算加速比 naive / tiled
+        float naive_ms = median_gpu_ms([&]() {
+            gemm_naive(d_A.data(), d_B.data(), d_C.data(), M, N, K, stream);
+        }, stream);
+
+        float tiled_ms = median_gpu_ms([&]() {
+            gemm_tiled(d_A.data(), d_B.data(), d_C.data(), M, N, K, stream);
+        }, stream);
+
+        char dim_str[32];
+        snprintf(dim_str, sizeof(dim_str), "%d,%d,%d", M, N, K);
+        printf("%-13s | %-12.4f | %-12.4f | %-11.2fx | %.2e (PASS)\n",
+               dim_str, naive_ms, tiled_ms, naive_ms / tiled_ms, max_err);
+    }
+
+    cuda_check(cudaStreamDestroy(stream));
+    return 0;
+}
+```
+
+3. 以 `Release` 优化模式编译、运行基准测试，并用 `compute-sanitizer` 检查内存错误：
+
+```bash
+cmake -S /root/cuda_tutorial -B /root/cuda_tutorial/build -DCMAKE_BUILD_TYPE=Release
+cmake --build /root/cuda_tutorial/build -j
+/root/cuda_tutorial/build/11_bench_sanitizer
+compute-sanitizer --tool memcheck /root/cuda_tutorial/build/11_bench_sanitizer
+```
+
+## 深入原理与避坑剖析（跑通代码后再看这 4 个问题）
+
+1. **为什么测 GPU 性能必须「预热 1 次 + 重复测 5 次取中位数」，而且读取时间前必须先等结束事件同步？**
+   - **为什么要预热（Warm-up）**：第 1 次调用核函数（尤其是像 Thrust 的 `exclusive_scan` 这种内部包含临时状态初始化或 JIT 缓存加载的操作）时，GPU 硬件和 CUDA Runtime 会有一次性的冷启动开销，耗时往往比正常状态慢几倍到几十倍。预热 1 次并同步等待完成后，后续测量才能反映真实的稳态算子性能。
+   - **为什么要取中位数（Median）而不是平均值（Mean）**：系统偶发的后台中断或调度抖动可能会让某一次测量出现极端高值（Outlier）。如果取平均值会被这一个极值拉偏，而将 5 次结果排序后取正中间的 `times[2]` 中位数，能够天然过滤掉偶发尖峰，结果最稳定。
+   - **为什么必须先 `cudaEventSynchronize(stop.value)`**：因为 `cudaEventRecord` 和核函数一样都是异步塞进 `stream` 里的，CPU 执行完 `cudaEventRecord(stop.value, stream)` 返回时，GPU 可能还没跑完核函数。如果立刻调 `cudaEventElapsedTime`，就会报错 `cudaErrorNotReady`。同样地，用 CPU 的 `steady_clock` 测端到端总耗时时，在记录结束时间点 `t1` 之前也必须先调用 `cudaStreamSynchronize(stream)` 等待 GPU 彻底完成。
+2. **对比实测表格里的两组时间：每项时间从哪里开始、到哪里结束？显存分配算进去了吗？**
+   - **显存分配（`DeviceBuffer` / `cudaMalloc`）是否计时**：输入与输出缓冲区在循环体外提前分配好并复用，**显存分配与释放本身不计入任何一项测量时间**。
+   - **筛选纯 GPU 时间（`atomic GPU ms` / `stable GPU ms`）**：从在 `stream` 中记录 `start` 事件开始，到记录 `stop` 事件结束。其中 `atomic` 包含 `cudaMemsetAsync` 清零 `count` 与 `atomic_kernel` 执行；`stable` 包含 `mark_kernel` 标记、`thrust::exclusive_scan` 扫描和 `scatter_kernel` 写出全部三步，不包含主机与设备间的数据拷贝。
+   - **筛选端到端总耗时（`atomic E2E ms` / `stable E2E ms`）**：用 `steady_clock` 测量，从 CPU 调用 `cudaMemcpyAsync(HostToDevice)` 向 GPU 传入输入数据开始，经过 GPU 筛选计算，再到把 `count` 和 `count` 个有效输出元素通过 `cudaMemcpyAsync(DeviceToHost)` 拷回 CPU 并完成 `cudaStreamSynchronize` 同步等待为止。
+   - **矩阵乘时间（`naive ms` / `tiled ms`）**：用 `cudaEvent_t` 测量单个矩阵乘法核函数（`naive_kernel` 或 `tiled_kernel`）在 `stream` 中的纯 GPU 执行时间，不含 H2D/D2H 传输。
+3. **为什么在实测中，「看似更高级的算法或优化版本」有时反而比普通版本更慢？**
+   - **现象 A：保序筛选 `stable` 比原子筛选 `atomic` 慢**：
+     1. **核函数启动次数与显存往返流量差距**：`atomic` 只需要 1 次 `cudaMemsetAsync` 加 1 个核函数，对输入数组只读 1 遍；而 `stable` 必须分三步启动多个核函数（`mark_kernel` + `thrust::exclusive_scan` 内部的多次扫描核函数 + `scatter_kernel`），不仅多了好几次 Kernel Launch 调度开销，还要反复读写额外的中间数组 `flags` 和 `offsets`。
+     2. **硬件原子指令加速**：现代架构（如 Hopper H20）在 L2 Cache 和硬件层面高度优化了原子加指令，因此如果不要求保序，单趟 `atomicAdd` 往往比多趟扫描快得多（`stable` 是用额外的计算和访存换取了「确定性保序」）。
+   - **现象 B：在小矩阵（如 `128×128`、`256×256`）下，共享内存 `tiled` 未必比 `naive` 快多少（甚至在部分卡上相近或略慢）**：
+     1. **大容量硬件 L2 Cache 已经帮 `naive` 兜底了**：当矩阵只有 `128×128`（仅 64 KB）或 `256×256`（仅 256 KB）时，整张矩阵 `A` 和 `B` 轻轻松松就能完全塞进 GPU 的片上 L1/L2 Cache（H20 的 L2 Cache 高达数十 MB）！这意味着 `naive` 核函数的后续重复读取其实全部命中了高速缓存，并没有真正去慢速 HBM 显存里拉数据。
+     2. **分块同步与指令开销**：与此同时，`tiled` 版本每走 16 步就要额外执行地址边界分支判断、往共享内存做一次显式写入，并强制全块 256 个线程停在两道 `__syncthreads()` 屏障上互相等候。当矩阵很小时，硬件缓存已经消除了显存瓶颈，这些额外的指令和同步屏障开销就会抵消掉共享内存带来的收益；只有当矩阵尺寸增大到超出缓存容量、真正受限于全局显存带宽时，分块优化的威力才会彻底爆发。
+4. **如何设计严密的单元测试来抓出 GPU 代码里的隐蔽 Bug？（挑选典型测试案例拆解）**
+   - **测试案例 1：专门测非整倍数尾部长度（如 `n = 1, 255, 257, 1025, 65537`）**
+     - **能抓出什么错误**：专门抓「网格数量计算错误（比如写成 `n / block` 忘了向上取整加 1，导致最后不足一个 Block 的尾部元素全没算）」或者「核函数里没写 `if (i < n)` / `for (int i = tid; i < n; i += stride)` 边界检查，导致最后一个 Block 里多余的线程越界读写显存」。配合 `compute-sanitizer --tool memcheck` 可以当场抓出越界非法访问。
+   - **测试案例 2：拿着同一个 `count` 缓冲区连续调用两次筛选函数（`repeat = 0..1`）**
+     - **能抓出什么错误**：专门抓「在 `filter_atomic` 里忘了每次用 `cudaMemsetAsync` 把 `count` 清零」的 Bug。如果只在外部分配显存时初始化一次 0，第 1 次调用虽然能蒙混过关，但第 2 次调用会在第 1 次的结果上继续累加，导致返回的 `count` 翻倍（变成 `2 * c`）甚至写穿 `out` 数组边界。
+   - **测试案例 3：全零输入模式（`pattern = 1`，所有 `a[i] == 0.0f`）与全负数模式（`pattern = 0`，所有 `a[i] == -1.0f`）**
+     - **能抓出什么错误**：全零模式专门抓「把非负条件 `a[i] >= 0` 误写成正数条件 `a[i] > 0`（漏掉 0）」，同时结合 `count` 校验防止把未写入的默认全零内存当成正确输出；全负数模式则专门验证当没有任何元素保留时，`count` 能否正确归零为 `0`。
+   - **测试案例 4：非 16 倍数矩阵边缘小块（如 `{17, 19, 23}`、`{33, 31, 65}`）与退化维度（`{3, 5, 0}`）**
+     - **能抓出什么错误**：`{17, 19, 23}` 专门抓分块矩阵乘在边缘小块加载共享内存时「越界没填 `0.0f`（读进垃圾数据污染内积）」、「把 `A` 的行数边界 `M` 和 `B` 的列数边界 `N` 写混」、或者「让 `row >= M || col >= N` 的边缘线程提前 `return` 导致少搬数据或 `__syncthreads()` 死锁」；而 `{3, 5, 0}` 则专门检验当公共维度 `K == 0` 时核函数是否依然启动并把输出矩阵 `C` 正确写满 `0.0f`。
+
+
 
 
 
