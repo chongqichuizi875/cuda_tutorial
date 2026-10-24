@@ -1893,6 +1893,244 @@ cmake --build /root/cuda_tutorial/build
    - 因为排他前缀和的定义是 `offsets[n - 1] = flags[0] + flags[1] + ... + flags[n - 2]`（前 `n - 1` 个元素里保留的个数），此时唯一没算进去的就是最后一个元素自己的标记 `flags[n - 1]`。把两者相加，正好等于全部 `n` 个元素里 `1` 的总和。
    - 当 `n > 0` 时，最后一个线程 `i == n - 1` 会用赋值语句 `*count = offsets[n - 1] + flags[n - 1];` 直接覆盖掉 `*count` 的旧值（不是 `+=` 累加），所以哪怕全负数（算出 `0 + 0 = 0`）、全零（算出 `(n - 1) + 1 = n`）或连续重复调用，结果都天然正确；唯独当 `n == 0` 时核函数不启动，才需要单独用 `cudaMemsetAsync(count, 0, sizeof(int), stream)` 把 `*count` 设为 `0`。
 
+---
+
+# 第十关：共享内存（Shared Memory）与分块矩阵乘法
+
+前面 9 关处理的都是一维数组，每个数据基本上只读一次。但到了二维矩阵乘法 `C = A × B`（其中 `A` 是 `M × K`，`B` 是 `K × N`，`C` 是 `M × N`，在一维显存里按行存放为 `A[row * K + k]`、`B[k * N + col]`、`C[row * N + col]`），如果让每个线程各自去全局显存里读 `A` 的一整行和 `B` 的一整列，同一个 `16 × 16` 线程块里的 256 个线程会把相同的 `A` 行和 `B` 列从慢速全局显存里反反复复重复读取 **16 遍**！
+
+为了把这 16 倍的重复读取省下来，这一关我们写一个程序 `10_tiled_2d.cu`，利用焊在 SM 芯片内部的超高速共享内存（`__shared__`），完成三件具体的事：
+
+1. **用 `16 × 16` 线程块协作搬运小块（Tile）**：在块内开辟两块共享内存黑板 `As[16][16]` 和 `Bs[16][16]`，沿着 `K` 维度每次切一段宽为 16 的小块（`for (int base = 0; base < K; base += 16)`），让 256 个线程一人从全局显存搬 1 个数贴到黑板上，然后大家在黑板上高速共享读取 16 次。
+2. **处理非 16 倍数的矩阵边缘（越界填 `0.0f`）**：当矩阵长宽不是 16 的整数倍（例如 `17 × 19 × 23`）时，超出 `A` 或 `B` 边界的载入位置统一填 `0.0f`（加 0 不会改变乘加结果），且**严禁边缘线程提前 `return`**。
+3. **用两道 `__syncthreads()` 同步栅栏卡住块内节奏**：第 1 道栅栏等全块 256 个线程都把当前小块写进 `As`、`Bs` 后再开始算乘加；第 2 道栅栏等所有人都算完本轮小块后，才允许进入下一轮覆盖黑板。
+
+```text
+矩阵尺寸: A (M × K), B (K × N), C (M × N)
+一维行主序下标公式: 元素 (r, c) 在总列数为 W 的矩阵中下标为 r * W + c
+  - A[r, c]  -->  A[r * K + c]   (A 每行有 K 个元素)
+  - B[r, c]  -->  B[r * N + c]   (B 每行有 N 个元素)
+  - C[r, c]  -->  C[r * N + c]   (C 每行有 N 个元素)
+
+当前轮次 base (0, 16, 32, ...):
+  线程 (ty, tx) 负责输出 C[row, col]，其中 row = blockIdx.y * 16 + ty, col = blockIdx.x * 16 + tx
+  1) 协作搬运 A 的小块: 读 A 的第 row 行、第 (base + tx) 列  --> 存入 As[ty][tx] (越界填 0.0f)
+  2) 协作搬运 B 的小块: 读 B 的第 (base + ty) 行、第 col 列  --> 存入 Bs[ty][tx] (越界填 0.0f)
+  3) __syncthreads()   <-- 第 1 道栅栏：等全块 256 个线程把黑板贴满！
+  4) for (t = 0..15) sum += As[ty][t] * Bs[t][tx]  <-- 直接在高速共享内存上算 16 次乘加
+  5) __syncthreads()   <-- 第 2 道栅栏：等全块 256 个线程都算完本轮，再进下一轮擦黑板！
+```
+
+## 动手写 `10_tiled_2d.cu`
+
+1. 先在 GPU 机器上打开 `vim /root/cuda_tutorial/CMakeLists.txt`，在文件末尾加一行：
+
+```cmake
+add_executable(10_tiled_2d 10_tiled_2d.cu)
+```
+
+2. 打开 `vim /root/cuda_tutorial/10_tiled_2d.cu`，敲入下面的代码（所有新语法的解释都直接写在了对应代码行的上方注释里，不用上下翻页对照）：
+
+```cpp
+#include <cuda_runtime.h>
+#include <cmath>
+#include <cstdio>
+#include <stdexcept>
+#include <vector>
+
+inline void cuda_check(cudaError_t status) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(status));
+    }
+}
+
+// ==================== 对照组：普通版矩阵乘法 (Naive GEMM) ====================
+// 每个线程直接从慢速全局显存读取 A 的一整行 (K 个数) 和 B 的一整列 (K 个数)。
+// 缺点：同一个 16x16 线程块里的 16 行线程，会把 B 的同一列从全局显存重复读 16 遍！
+__global__ void gemm_naive_kernel(const float* A, const float* B,
+                                  float* C, int M, int N, int K) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= M || col >= N) return;
+
+    float sum = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        sum += A[row * K + k] * B[k * N + col];
+    }
+    C[row * N + col] = sum;
+}
+
+// ==================== 核心主角：共享内存分块矩阵乘法 (Tiled GEMM) ====================
+__global__ void gemm_tiled_kernel(const float* A, const float* B,
+                                  float* C, int M, int N, int K) {
+    // 【1. 声明片上共享内存 (__shared__)】
+    // 语法拆解：
+    //   - __shared__ 表示这两个 16x16 的二维数组分配在 SM 芯片内部的超高速共享内存（Shared Memory）上。
+    //   - 同一个 Block 里的 256 个线程共享同一份 As 和 Bs（就像教室墙上的公共黑板）；
+    //     不同 Block 之间各自有独立的黑板，互不干扰。
+    __shared__ float As[16][16];
+    __shared__ float Bs[16][16];
+
+    // 【2. 计算当前线程在块内的局部坐标 (ty, tx) 和在矩阵 C 中的全局行列号 (row, col)】
+    //   - 注意对应关系：x 维度对应列号 col（水平方向），y 维度对应行号 row（垂直方向）。
+    //   - 这样同一个 Warp 里相邻的 threadIdx.x (0, 1, 2...) 对应的 col 也是连续的，读写内存时能触发合并访问！
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * 16 + ty;
+    int col = blockIdx.x * 16 + tx;
+
+    // 每个线程用自己的私有寄存器 sum 累加 C[row, col] 的点积结果
+    float sum = 0.0f;
+
+    // 【3. 沿着公共维度 K，每次切宽为 16 的一小块（Tile）推进】
+    //   - 注意：前面千万【不能】写 if (row >= M || col >= N) return; 提前退出！
+    //   - 因为哪怕某个边缘线程自己的输出坐标 (row, col) 超出了 C 的边界，
+    //     它依然要帮同块的伙伴搬运 A 或 B 里的合法元素，并且必须一起参加下面的 __syncthreads() 同步！
+    for (int base = 0; base < K; base += 16) {
+        // ---- 步骤 A：256 个线程协作，把 A 和 B 的当前 16x16 小块搬进共享内存 As 和 Bs ----
+        // 1) 搬 A 的元素：当前小块在 A 中的行号是 row，列号是 a_col = base + tx。
+        //    如果行号 row < M 且列号 a_col < K，就从全局显存读 A[row * K + a_col]；
+        //    否则说明超出了矩阵 A 的边界，填 0.0f（因为 0 乘任何数都是 0，不会污染后面的累加 sum）。
+        int a_col = base + tx;
+        if (row < M && a_col < K) {
+            As[ty][tx] = A[row * K + a_col];
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        // 2) 搬 B 的元素：当前小块在 B 中的行号是 b_row = base + ty，列号是 col。
+        //    如果行号 b_row < K 且列号 col < N，就从全局显存读 B[b_row * N + col]；
+        //    否则超出了矩阵 B 的边界，同样填 0.0f。
+        int b_row = base + ty;
+        if (b_row < K && col < N) {
+            Bs[ty][tx] = B[b_row * N + col];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        // ---- 步骤 B：第 1 次块内同步屏障 (__syncthreads) ----
+        // 为什么要等？因为计算 sum 时，当前线程 (ty, tx) 需要读取 As[ty][0..15] 和 Bs[0..15][tx]，
+        // 这些格子是由同一个 Block 里的【其他线程】负责搬运的！
+        // 必须等全块 256 个线程全部把数据写进 As 和 Bs 后，大家才能开始读黑板（防止“写后读 RAW”竞争）。
+        __syncthreads();
+
+        // ---- 步骤 C：在超高速共享内存上计算当前 16x16 小块的乘积累加 ----
+        for (int t = 0; t < 16; ++t) {
+            sum += As[ty][t] * Bs[t][tx];
+        }
+
+        // ---- 步骤 D：第 2 次块内同步屏障 (__syncthreads) ----
+        // 为什么要等？如果跑得快的线程先算完了这 16 次乘加，直接冲进下一轮 for 循环（base += 16），
+        // 它就会把下一轮的新数据写进 As[ty][tx] 和 Bs[ty][tx]，把黑板上旧数据擦掉！
+        // 而此时跑得慢的线程可能还在用本轮的旧数据算 sum！所以必须等大家都用完本轮黑板，才能一起进下一轮（防止“读后写 WAR”竞争）。
+        __syncthreads();
+    }
+
+    // 【4. 全部小块累加完毕后，只让落在矩阵 C 合法范围内的线程把结果写回全局显存】
+    //   - 注意：当 K == 0 时，上面的 for 循环一次都不会执行，sum 保持初值 0.0f，
+    //     这里依然会把 C 的所有合法位置正确写成 0.0f！
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+// ==================== 主机端异步启动包装函数 ====================
+void gemm_tiled_async(const float* d_A, const float* d_B, float* d_C,
+                      int M, int N, int K, cudaStream_t stream) {
+    // 边界保护：如果输出矩阵 C 的行数 M 或列数 N 为 0（输出为空），直接返回不启动核函数。
+    // （注意：如果 M > 0 且 N > 0，哪怕 K == 0 也要正常启动核函数，把输出矩阵 C 清零！）
+    if (M <= 0 || N <= 0) return;
+
+    // 固定使用 16 x 16 的二维线程块（共 256 个线程）
+    dim3 block(16, 16);
+    // 二维网格向上取整：x 方向覆盖 N 列，y 方向覆盖 M 行
+    dim3 grid((N - 1) / 16 + 1, (M - 1) / 16 + 1);
+
+    gemm_tiled_kernel<<<grid, block, 0, stream>>>(d_A, d_B, d_C, M, N, K);
+    cuda_check(cudaGetLastError());
+}
+
+int main() {
+    cudaStream_t stream;
+    cuda_check(cudaStreamCreate(&stream));
+
+    // 故意选一个全不是 16 倍数的非方阵尺寸：M = 17, N = 19, K = 23
+    const int M = 17, N = 19, K = 23;
+    std::vector<float> h_A(M * K), h_B(K * N), h_C_ref(M * N, 0.0f), h_C_gpu(M * N, 0.0f);
+
+    for (int i = 0; i < M * K; ++i) h_A[i] = float(i % 11 - 5) / 8.0f;
+    for (int i = 0; i < K * N; ++i) h_B[i] = float(i % 7 - 3) / 4.0f;
+
+    // 在 CPU 上算出标准答案 h_C_ref
+    for (int r = 0; r < M; ++r) {
+        for (int c = 0; c < N; ++c) {
+            double s = 0.0;
+            for (int k = 0; k < K; ++k) {
+                s += double(h_A[r * K + k]) * double(h_B[k * N + c]);
+            }
+            h_C_ref[r * N + c] = float(s);
+        }
+    }
+
+    float *d_A = nullptr, *d_B = nullptr, *d_C = nullptr;
+    cuda_check(cudaMalloc(&d_A, M * K * sizeof(float)));
+    cuda_check(cudaMalloc(&d_B, K * N * sizeof(float)));
+    cuda_check(cudaMalloc(&d_C, M * N * sizeof(float)));
+
+    cuda_check(cudaMemcpyAsync(d_A, h_A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice, stream));
+    cuda_check(cudaMemcpyAsync(d_B, h_B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice, stream));
+
+    // 启动共享内存分块矩阵乘法
+    gemm_tiled_async(d_A, d_B, d_C, M, N, K, stream);
+
+    cuda_check(cudaMemcpyAsync(h_C_gpu.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    cuda_check(cudaStreamSynchronize(stream));
+
+    // 计算最大绝对误差
+    float max_err = 0.0f;
+    for (int i = 0; i < M * N; ++i) {
+        max_err = std::max(max_err, std::abs(h_C_gpu[i] - h_C_ref[i]));
+    }
+    printf("非 16 倍数矩阵乘法 (M=%d, N=%d, K=%d) 验证:\n", M, N, K);
+    printf("  C[0, 0]   : GPU = %.6f, CPU = %.6f\n", h_C_gpu[0], h_C_ref[0]);
+    printf("  C[16, 18] : GPU = %.6f, CPU = %.6f\n", h_C_gpu[M * N - 1], h_C_ref[M * N - 1]);
+    printf("  最大绝对误差: %.2e (%s)\n", max_err, max_err < 1e-4f ? "PASS" : "FAIL");
+
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    cudaStreamDestroy(stream);
+    return 0;
+}
+```
+
+3. 编译并运行：
+
+```bash
+cmake -S /root/cuda_tutorial -B /root/cuda_tutorial/build
+cmake --build /root/cuda_tutorial/build
+/root/cuda_tutorial/build/10_tiled_2d
+```
+
+## 深入原理与避坑剖析（跑通代码后再看这 5 个问题）
+
+1. **每个线程负责哪个位置？搬运小块时为什么 `A` 的列号是 `base + tx`，而 `B` 的行号是 `base + ty`？**
+   - **输出位置映射**：二维线程块大小为 `16 × 16`，块内局部坐标为 `tx = threadIdx.x`、`ty = threadIdx.y`。每个线程唯一负责输出矩阵 `C` 中的一个元素 `C[row, col]`，其中行号 `row = blockIdx.y * 16 + ty`，列号 `col = blockIdx.x * 16 + tx`。
+   - **小块读取地址推导**：在第 `base / 16` 轮循环中，当前线程块需要把 `A` 的子块 `A[blockIdx.y*16 .. +15][base .. base+15]` 搬进 `As[16][16]`，因此线程 `(ty, tx)` 对应的行号就是 `row`，列号就是 `base + tx`（一维下标 `row * K + (base + tx)`）；同理，需要把 `B` 的子块 `B[base .. base+15][blockIdx.x*16 .. +15]` 搬进 `Bs[16][16]`，线程 `(ty, tx)` 对应的行号是 `base + ty`，列号是 `col`（一维下标 `(base + ty) * N + col`）。超出 `row < M && base + tx < K` 或 `base + ty < K && col < N` 范围的位置统一填入 `0.0f`。
+2. **循环里的两处 `__syncthreads()` 分别在等什么？为什么边缘越界线程绝不能提前 `return`？**
+   - **第 1 处 `__syncthreads()`（加载后、计算前）**：等待同一个线程块内的全部 256 个线程都把当前小块的数据写入 `As` 和 `Bs`，防止某些跑得快的线程在别的线程还没写完时就去读取未就绪的共享内存（防 Read-After-Write / RAW 数据竞争）。
+   - **第 2 处 `__syncthreads()`（计算后、下一轮加载前）**：等待全块所有线程都算完当前小块的 16 次乘加，防止跑得快的线程提前进入下一轮循环（`base += 16`）覆盖掉慢线程还在读取的 `As` 和 `Bs`（防 Write-After-Read / WAR 数据竞争）。
+   - **为什么边缘线程不能提前 `return`**：第一，某线程虽然输出坐标 `col >= N`（超出 `C` 的右边界），但它的 `row < M` 且 `base + tx < K` 可能是合法的，同块其他合法线程算内积时指望着它把 `As[ty][tx]` 搬进来；第二，`__syncthreads()` 要求同一个 Block 内的所有线程必须全员到达，如果有部分线程提前 `return`，将导致未定义行为或死锁。
+3. **共享内存（Shared Memory）究竟是怎样减少全局显存重复读取的？**
+   - 在普通版（Naive）中，每个线程算 1 个输出元素要从全局显存读 `K` 次 `A` 和 `K` 次 `B`，一个 `16 × 16` 线程块总共发起 `256 × 2K` 次全局显存读取。
+   - 而在共享内存分块版（Tiled）中，每个元素只由 1 个线程从慢速全局显存读入共享内存 **1 次**，随后被同一行（或同一列）的 **16 个线程在片上高速共享内存中重复读取 16 次**，从而将全局显存的访问流量直接降低到了原来的 **`1 / 16`**，大幅缓解了显存带宽瓶颈。
+4. **相邻线程连续访问（合并访存 Coalesced Access）有什么用？**
+   - 因为矩阵按行主序存储，同一行相邻列的元素在显存地址上是紧挨着的。我们将列偏移绑定到 `tx = threadIdx.x`（加载 `A[row * K + (base + tx)]`、`B[(base + ty) * N + col]` 以及写回 `C[row * N + col]`），使得同一个 Warp 内相邻的 `tx` 线程在同一时刻访问连续的全局显存地址。GPU 硬件可以将这些连续访问打包合并为极少数几次 128 字节内存事务（Coalesced Memory Access），最大化显存带宽利用率。
+5. **既然分块能减少重复读取，那把小块越调越大（比如从 `16 × 16` 改成 `32 × 32` 甚至更大）为什么未必更快？**
+   - **硬件资源受限与 SM 占用率（Occupancy）下降**：每个 SM 上的共享内存容量和寄存器总数是固定的，且单 Block 线程数上限为 1024（`32 × 32 = 1024` 已达硬上限，再大直接无法启动）。当分块变大时，单 Block 占用的共享内存（翻 4 倍）和线程数激增，导致每个 SM 能同时驻留并发执行的活跃 Block 数量减少，SM 占用率（Occupancy）下降，反而不利于隐藏访存与指令延迟。
+   - **同步与小矩阵尾部浪费增加**：更大的线程块意味着每次 `__syncthreads()` 需要等待多达 1024 个线程（32 个 Warp）全部到齐，块内木桶效应更明显；且当矩阵尺寸较小时（如 `128 × 128`），总 Block 数过少无法铺满 GPU 的全部 SM，或者边缘非整倍数块的空闲线程浪费比例更高。
+
+
 
 
 
