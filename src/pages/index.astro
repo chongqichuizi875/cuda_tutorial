@@ -11,10 +11,10 @@ const posts = (await getCollection('blog')).sort(
 <BaseLayout title="CUDA 编程学习笔记">
   <main class="wrap home">
     <section class="hero">
-      <div class="hero-tag">NVIDIA H20 · Hopper sm_90 · CUDA 12.9</div>
+      <div class="hero-tag">CUDA 12.9 · C++17 · 11 关完整实战</div>
       <h1>CUDA 编程学习与实验博客</h1>
       <p class="lede">
-        记录在单机 H20 上从零手敲 CUDA 代码的完整闯关过程：从 Host/Device 分离编译、SIMT 线程束硬件调度验证，到显存管理、Grid-Stride Loop、Thrust 算子传递与原子锁实现。
+        记录从零手敲 11 关 CUDA 代码的完整进阶过程：从 Host/Device 分离编译、SIMT 线程束硬件调度验证、Grid-Stride Loop 合并访存、Thrust 算子传递与原子锁，到 RAII 异步流、排他前缀和保序筛选、共享内存分块矩阵乘法与 GPU 性能评测。
       </p>
     </section>
 

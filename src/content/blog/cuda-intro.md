@@ -1,10 +1,10 @@
 ---
-title: "CUDA 入门：从零手敲 6 关实战笔记"
-subtitle: "在 NVIDIA H20 (Hopper sm_90, CUDA 12.9) 上从第一个核函数出发，实测验证 SIMT 线程束硬件调度、显存隔离与通信、Grid-Stride Loop 合并访存、Thrust 算子传递与原子锁实现"
-description: "围绕 6 个递进的 CUDA 实验程序（01_hello.cu ～ 06_atomic.cu），完整记录 Host/Device 分离编译、Block/Warp/Thread 三级硬件执行顺序 1000 次统计验证、cudaMemcpy 与 Unified Memory 对比、Grid-Stride Loop 合并访问原理、Functor/Lambda 算子传递以及 atomicAdd 与手搓 atomicCAS 乐观锁。"
-pubDate: 2026-10-23
+title: "CUDA 入门与进阶：从零手敲 11 关实战笔记"
+subtitle: "从 Host/Device 分离编译、SIMT 线程束硬件调度、Grid-Stride Loop 与原子操作，到 RAII 异步流、Stream Compaction、共享内存分块矩阵乘法与 GPU 精准计时"
+description: "围绕 11 个递进的 CUDA 实战程序（01_hello.cu ～ 11_bench_sanitizer.cu），完整记录：Host/Device 分离编译、Block/Warp/Thread 三级硬件执行顺序 1000 次统计验证、cudaMemcpy 与 Unified Memory 对比、Grid-Stride Loop 合并访存、Thrust 算子传递、atomicAdd 与 atomicCAS 乐观锁、RAII 显存管理与 CUDA Stream 异步流水线、atomicAdd 与 Exclusive Scan 流压缩筛选、Shared Memory 分块矩阵乘法（Tiled GEMM），以及 cudaEvent_t / compute-sanitizer 性能评测与内存检查。"
+pubDate: 2026-10-24
 dateRange: "2026.10"
-tags: ["CUDA", "GPU 体系结构", "H20 (sm_90)", "C++17", "并行计算", "Thrust"]
+tags: ["CUDA", "GPU 体系结构", "C++17", "并行计算", "Thrust", "Shared Memory", "Stream"]
 ---
 
 # 第一个CUDA程序
